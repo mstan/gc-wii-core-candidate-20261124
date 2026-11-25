@@ -1,0 +1,200 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * gcnrecomp runtime — M0 seed-contract unit test.
+ *
+ * Asserts the M0 deliverable without executing any PPC:
+ *   1. MEM1 mirrors Dolphin's two Load_BS2 slices at 0x81200000/0x81300000.
+ *   2. CPU registers and entry PC match the shared 0x81200150 seam.
+ *   3. The SRAM fixture's stored checksum validates (OSRtc.c algorithm).
+ * Plus faithfulness checks on the bus: big-endian round-trip and the
+ * cached/uncached mirror collapsing to the same bytes; and the MEM1 reset fill
+ * outside the payload.
+ *
+ * The test is self-contained: it synthesises a payload of the exact BS2 size so
+ * ctest passes with no copyrighted firmware present. If the environment variable
+ * GCN_BS2_PATH points at a real descrambled BS2 dump of the right size, it is
+ * additionally seeded and checked (never required).
+ */
+#include "seed/seed.h"
+#include "memory/memory.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int g_failures = 0;
+
+#define CHECK(cond, msg) do { \
+    if (!(cond)) { fprintf(stderr, "FAIL: %s (%s:%d)\n", (msg), __FILE__, __LINE__); g_failures++; } \
+    else { fprintf(stdout, "ok: %s\n", (msg)); } \
+} while (0)
+
+/* Deterministic synthetic payload: byte i = low 8 bits of a mixing function of
+ * i, so every 4-byte word is distinct and order-sensitive. */
+static u8 synth_byte(u32 i) {
+    u32 x = i * 2654435761u;      /* Knuth multiplicative hash */
+    return (u8)((x >> 24) ^ (x >> 3) ^ i);
+}
+
+static void fill_synth(u8* buf, u32 size) {
+    for (u32 i = 0; i < size; i++) buf[i] = synth_byte(i);
+}
+
+/* Verify the seed mirrored the independent Load_BS2 seam in MEM1/CPU state. */
+static void check_seeded(CPUState* cpu, const GcnSeedDevices* dev,
+                         const GcnSeedConfig* cfg) {
+    /* (2) entry PC */
+    CHECK(cpu->pc == GCN_BS2_ENTRY_PC, "entry PC == 0x81200150");
+
+    /* (1) the executable BS1 tail is the only payload at 0x81200000 */
+    u32 avail = 0;
+    u8* host = gcn_mem_resolve(cpu, cfg->load_addr, &avail);
+    CHECK(host != NULL, "load address resolves into MEM1");
+    CHECK(avail >= GCN_BS2_BOOT_COPY_SIZE, "boot slice fits within MEM1");
+    if (host) {
+        CHECK(memcmp(host, cfg->payload, GCN_BS2_BOOT_COPY_SIZE) == 0,
+              "MEM1 holds the 0x700-byte BS1 tail at 0x81200000");
+        CHECK(read_be32(host + GCN_BS2_BOOT_COPY_SIZE) == cfg->mem1_fill,
+              "MEM1 immediately after the BS1 tail remains reset-filled");
+    }
+
+    /* (1b) same bytes visible through the uncached mirror (0xC0000000 alias) */
+    u32 uncached_addr = (cfg->load_addr - GC_RAM_BASE) + GC_RAM_UNCACHED;
+    u8* host_uncached = gcn_mem_resolve(cpu, uncached_addr, NULL);
+    CHECK(host_uncached == host,
+          "uncached mirror aliases the same MEM1 bytes as cached");
+
+    /* (1c) the BS2 body begins at payload-relative 0x720, guest 0x81300000. */
+    u32 stage2_size = cfg->payload_size - GCN_BS2_STAGE2_PAYLOAD_OFF;
+    u8* stage2 = gcn_mem_resolve(cpu, GCN_BS2_STAGE2_LOAD_ADDR, &avail);
+    CHECK(stage2 != NULL && avail >= stage2_size, "BS2 body fits at 0x81300000");
+    if (stage2) {
+        CHECK(memcmp(stage2, cfg->payload + GCN_BS2_STAGE2_PAYLOAD_OFF,
+                     stage2_size) == 0,
+              "MEM1 holds the BS2 body bytes at 0x81300000");
+    }
+    u32 expect = read_be32(cfg->payload + cfg->payload_size - 4);
+    u32 got = mem_read32(cpu, GCN_BS2_STAGE2_LOAD_ADDR + stage2_size - 4);
+    CHECK(got == expect, "mem_read32 returns big-endian BS2 tail word");
+
+    /* (1d) MEM1 immediately before the payload holds the reset fill */
+    if (cfg->load_addr > GC_RAM_BASE) {
+        u32 before = mem_read32(cpu, cfg->load_addr - 4);
+        CHECK(before == cfg->mem1_fill, "MEM1 before payload == reset fill");
+    }
+
+    CHECK(cpu->gpr[3] == 0xFFF0001Fu && cpu->gpr[4] == 0x00002030u &&
+          cpu->gpr[5] == 0x0000009Cu,
+          "Load_BS2 seam GPR3/GPR4/GPR5 match the oracle");
+    CHECK(cpu->msr == 0x00002030u, "Load_BS2 seam MSR == FP|IR|DR");
+    CHECK(cpu->spr[1008] == 0x0011C464u, "Load_BS2 seam HID0 matches GC");
+    CHECK(cpu->spr[528] == 0x80001FFFu && cpu->spr[529] == 0x00000002u &&
+          cpu->spr[536] == 0x80001FFFu && cpu->spr[537] == 0x00000002u &&
+          cpu->spr[538] == 0xC0001FFFu && cpu->spr[539] == 0x0000002Au &&
+          cpu->spr[534] == 0xFFF0001Fu && cpu->spr[535] == 0xFFF00001u &&
+          cpu->spr[542] == 0xFFF0001Fu && cpu->spr[543] == 0xFFF00001u,
+          "Load_BS2 seam BAT state matches the oracle");
+
+    /* (3) SRAM checksum validates */
+    CHECK(gcn_sram_validate(dev->sram),
+          "SRAM fixture checksum validates (OSRtc.c algorithm)");
+
+    /* device RTC fixture present */
+    CHECK(dev->rtc_counter == cfg->rtc_counter, "RTC fixture counter installed");
+}
+
+/* Independent recomputation of the SRAM checksum for a hand-built image with
+ * known settings, to pin the algorithm itself (not just self-consistency). */
+static void test_sram_algorithm(void) {
+    GcnSeedConfig cfg;
+    gcn_seed_default_config(&cfg);
+    cfg.language = 0;         /* English */
+    cfg.sound_stereo = 1;     /* flags bit2 */
+    cfg.progressive = 0;
+    cfg.video_mode = 0;       /* NTSC */
+    cfg.counter_bias = 0;
+
+    u8 sram[GCN_SRAM_SIZE];
+    gcn_seed_build_sram(sram, &cfg);
+
+    /* A normal initialized console auto-boots a mounted disc. */
+    CHECK(sram[0x13] == 0x0C,
+          "SRAM flags == 0x0C (stereo/OOBE-done/NTSC/non-progressive/auto-boot)");
+    CHECK(sram[0x12] == 0x00, "SRAM language == English (0)");
+
+    /* Manually recompute the checksum over the four BE16 words 0x0C..0x12. */
+    u16 sum = 0, inv = 0;
+    for (u32 off = 0x0C; off < 0x14; off += 2) {
+        u16 w = read_be16(sram + off);
+        sum = (u16)(sum + w);
+        inv = (u16)(inv + (u16)~w);
+    }
+    CHECK(read_be16(sram + 0x00) == sum, "stored checkSum matches manual recompute");
+    CHECK(read_be16(sram + 0x02) == inv, "stored checkSumInv matches manual recompute");
+
+    /* Corrupting a covered byte must invalidate the SRAM. */
+    u8 bad[GCN_SRAM_SIZE];
+    memcpy(bad, sram, sizeof(bad));
+    bad[0x13] ^= 0x04;   /* flip the sound bit */
+    CHECK(!gcn_sram_validate(bad), "checksum rejects a corrupted flags byte");
+}
+
+int main(void) {
+    fprintf(stdout, "== gcnrecomp M0 seed-contract test ==\n");
+
+    /* --- SRAM algorithm pinning --- */
+    test_sram_algorithm();
+
+    /* --- synthetic payload path (always runs) --- */
+    CPUState cpu;
+    CHECK(cpu_init(&cpu), "cpu_init allocates MEM1");
+
+    u8* payload = (u8*)malloc(GCN_BS2_USA_SIZE);
+    CHECK(payload != NULL, "allocate synthetic payload");
+    if (payload) {
+        fill_synth(payload, GCN_BS2_USA_SIZE);
+
+        GcnSeedConfig cfg;
+        gcn_seed_default_config(&cfg);
+        cfg.payload = payload;
+        cfg.payload_size = GCN_BS2_USA_SIZE;
+
+        GcnSeedDevices dev;
+        CHECK(gcn_seed_apply(&cpu, &dev, &cfg), "gcn_seed_apply (synthetic)");
+        check_seeded(&cpu, &dev, &cfg);
+
+        /* A wrong-sized payload must be rejected (no silent truncation). */
+        GcnSeedConfig bad = cfg;
+        bad.payload_size = GCN_BS2_USA_SIZE - 4;
+        CHECK(!gcn_seed_apply(&cpu, &dev, &bad),
+              "gcn_seed_apply rejects a wrong-sized payload");
+
+        free(payload);
+    }
+
+    /* --- optional real BS2 path (only if a dump is provided) --- */
+    const char* real = getenv("GCN_BS2_PATH");
+    if (real && *real) {
+        u8* data = NULL; u32 size = 0;
+        if (gcn_seed_read_file(real, &data, &size)) {
+            fprintf(stdout, "-- real BS2 provided: %s (0x%X bytes)\n", real, size);
+            GcnSeedConfig cfg;
+            gcn_seed_default_config(&cfg);
+            cfg.payload = data;
+            cfg.payload_size = size;
+            GcnSeedDevices dev;
+            CHECK(gcn_seed_apply(&cpu, &dev, &cfg), "gcn_seed_apply (real BS2)");
+            if (size == GCN_BS2_USA_SIZE) check_seeded(&cpu, &dev, &cfg);
+            free(data);
+        }
+    }
+
+    cpu_free(&cpu);
+
+    if (g_failures) {
+        fprintf(stderr, "\n%d check(s) FAILED\n", g_failures);
+        return 1;
+    }
+    fprintf(stdout, "\nall checks passed\n");
+    return 0;
+}

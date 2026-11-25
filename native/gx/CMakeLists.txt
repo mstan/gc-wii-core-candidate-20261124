@@ -1,0 +1,151 @@
+get_filename_component(GC_WII_GX_ROOT "../.." ABSOLUTE BASE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+option(GC_WII_GX_WII "Wii GPU physical-address fields (GameCube preserves its original masks)" OFF)
+target_compile_definitions(aurora_gx PRIVATE GC_WII_GX_WII=$<BOOL:${GC_WII_GX_WII}>)
+set(GCNLLR_RENDER_PIPELINE "retail" CACHE STRING "Native Aurora command/batch owner; packet is a legacy comparison build")
+set_property(CACHE GCNLLR_RENDER_PIPELINE PROPERTY STRINGS packet retail)
+if(NOT GCNLLR_RENDER_PIPELINE MATCHES "^(packet|retail)$")
+  message(FATAL_ERROR "Unknown native render pipeline")
+endif()
+set(GCNLLR_VERTEX_PREPARATION "planned" CACHE STRING "Native vertex preparation: planned or reference")
+set_property(CACHE GCNLLR_VERTEX_PREPARATION PROPERTY STRINGS planned reference)
+if(NOT GCNLLR_VERTEX_PREPARATION MATCHES "^(planned|reference)$")
+  message(FATAL_ERROR "Unknown native vertex preparation")
+endif()
+target_compile_definitions(aurora_gx PRIVATE GCNLLR_RETAIL_VERTEX_PLAN=$<STREQUAL:${GCNLLR_VERTEX_PREPARATION},planned>)
+option(GCNLLR_NATIVE_PIPELINE "Consolidated owner memory and FIFO ingress provider" OFF)
+option(GCNLLR_COMPILED_SURFACES "Submit geometry-only display lists as prepared host surfaces" OFF)
+option(GCNLLR_PERSISTENT_GEOMETRY "Retain epoch-validated native vertex and index data on the GPU" OFF)
+if(GCNLLR_PERSISTENT_GEOMETRY AND (NOT GCNLLR_COMPILED_SURFACES OR
+   NOT GCNLLR_RENDER_PIPELINE STREQUAL "retail" OR NOT GCNLLR_GPU_VISIBLE_CACHE))
+  message(FATAL_ERROR "Persistent geometry requires compiled Aurora surfaces and visible memory epochs")
+endif()
+option(GCNLLR_DIRECT_DISPLAY_COPY "Encode eager display copies directly from the resolved EFB" OFF)
+target_compile_definitions(aurora_gx PRIVATE GCNLLR_COMPILED_SURFACES=$<BOOL:${GCNLLR_COMPILED_SURFACES}>
+  GCNLLR_PERSISTENT_GEOMETRY=$<BOOL:${GCNLLR_PERSISTENT_GEOMETRY}>)
+option(GCNLLR_NATIVE_DRAW_SINK "Unqualified experimental single-state draw sink" OFF)
+option(GCNLLR_ASYNC_COPIES "Batch GPU readbacks with ordered owner retirement" OFF)
+if(GCNLLR_ASYNC_COPIES AND (NOT GCNLLR_RESIDENT_XFB OR NOT GCNLLR_GX_COOPERATIVE_VI))
+  message(FATAL_ERROR "Streamed copies require observed memory and cooperative completion")
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/adapt_window.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/adapt_retail.cmake")
+set(GCNLLR_GPU_BACKEND "auto" CACHE STRING "Native GPU backend: auto, d3d12 or vulkan")
+option(GCNLLR_GX_FIFO_WORKER "Translate native FIFO on a cooperating worker" OFF)
+if(GCNLLR_NATIVE_PIPELINE AND GCNLLR_GX_FIFO_WORKER)
+  message(FATAL_ERROR "Native memory/FIFO ingress requires one machine-thread owner")
+endif()
+option(GCNLLR_GX_COOPERATIVE_VI "Present completed VI scanout with donor-style recording ownership" OFF)
+option(GCNLLR_COMPOSED_SCANOUT "Keep streamed generations owned for native VI and demand RAM reads" OFF)
+option(GCNLLR_GPU_OWNED_DISPLAY "Present retained display color and encode guest XFB bytes on demand" OFF)
+option(GCNLLR_GPU_OWNED_TEXTURES "Bind EFB copy textures directly until an actual byte observation" OFF)
+option(GCNLLR_GPU_FRAME_PACKETS "Keep owned EFB copies in the consuming frame submission" OFF)
+if(GCNLLR_GPU_FRAME_PACKETS AND NOT GCNLLR_GPU_OWNED_TEXTURES)
+  message(FATAL_ERROR "Single frame packets require GPU ownership of display and texture copies")
+endif()
+if(GCNLLR_GPU_OWNED_TEXTURES AND NOT GCNLLR_GPU_OWNED_DISPLAY)
+  message(FATAL_ERROR "GPU-owned textures require the same renderer to own display copies")
+endif()
+set(GCNLLR_GX_SUBMISSION "segmented" CACHE STRING "Build-time native submission: segmented, batched or queued")
+set_property(CACHE GCNLLR_GX_SUBMISSION PROPERTY STRINGS segmented batched queued)
+set(GCNLLR_GX_COMPLETION "physical" CACHE STRING "Build-time PE completion: physical or owned")
+set_property(CACHE GCNLLR_GX_COMPLETION PROPERTY STRINGS physical owned)
+if(NOT GCNLLR_GX_COMPLETION MATCHES "^(physical|owned)$")
+  message(FATAL_ERROR "Unknown graphics completion provider")
+endif()
+if(GCNLLR_GX_COMPLETION STREQUAL "owned" AND NOT GCNLLR_COMPOSED_SCANOUT)
+  message(FATAL_ERROR "Owned completion requires composed observed GPU ownership")
+endif()
+if(NOT GCNLLR_GX_SUBMISSION MATCHES "^(segmented|batched|queued)$")
+  message(FATAL_ERROR "Unknown native graphics submission provider")
+endif()
+if(GCNLLR_DIRECT_DISPLAY_COPY AND (GCNLLR_RESIDENT_XFB OR NOT GCNLLR_GX_SUBMISSION STREQUAL "segmented"))
+  message(FATAL_ERROR "Direct eager display copies require the segmented, eager ownership provider")
+endif()
+if(GCNLLR_GPU_OWNED_DISPLAY AND (NOT GCNLLR_RESIDENT_XFB OR NOT GCNLLR_GX_COOPERATIVE_VI OR
+    GCNLLR_GX_FIFO_WORKER OR GCNLLR_ASYNC_COPIES OR NOT GCNLLR_GX_SUBMISSION STREQUAL "queued"))
+  message(FATAL_ERROR "GPU-owned display requires queued owner-thread VI with resident XFB storage")
+endif()
+if(NOT GCNLLR_GX_SUBMISSION STREQUAL "segmented" AND NOT GCNLLR_COMPOSED_SCANOUT AND NOT GCNLLR_GPU_OWNED_DISPLAY)
+  message(FATAL_ERROR "Batched submission requires composed observed GPU ownership")
+endif()
+set(_gcnllr_batched_submission OFF)
+if(NOT GCNLLR_GX_SUBMISSION STREQUAL "segmented")
+  set(_gcnllr_batched_submission ON)
+endif()
+if(GCNLLR_COMPOSED_SCANOUT AND (NOT GCNLLR_ASYNC_COPIES OR NOT GCNLLR_RESIDENT_XFB OR NOT GCNLLR_GX_COOPERATIVE_VI OR GCNLLR_GX_FIFO_WORKER))
+  message(FATAL_ERROR "Composed scanout requires the observed owner-thread streamed provider group")
+endif()
+if(GCNLLR_GX_COOPERATIVE_VI AND NOT GCNLLR_GX_FIFO_WORKER AND NOT GCNLLR_ASYNC_COPIES AND NOT GCNLLR_RESIDENT_XFB)
+  message(FATAL_ERROR "Cooperating VI requires threaded translation or an observed owner-copy group")
+endif()
+if(NOT GCNLLR_GPU_BACKEND MATCHES "^(auto|d3d12|vulkan)$")
+  message(FATAL_ERROR "Unknown native GPU backend: ${GCNLLR_GPU_BACKEND}")
+endif()
+add_library(gcnllr-native-gx SHARED "${CMAKE_CURRENT_LIST_DIR}/gx.cpp" "${CMAKE_CURRENT_LIST_DIR}/gpu_bridge.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/efb_depth.cpp")
+if(GCNLLR_GPU_BACKEND STREQUAL "vulkan")
+  target_compile_definitions(gcnllr-native-gx PRIVATE GCNLLR_GPU_VULKAN=1)
+elseif(GCNLLR_GPU_BACKEND STREQUAL "d3d12")
+  if(NOT WIN32)
+    message(FATAL_ERROR "D3D12 requires Windows")
+  endif()
+  target_compile_definitions(gcnllr-native-gx PRIVATE GCNLLR_GPU_D3D12=1)
+endif()
+set_target_properties(gcnllr-native-gx PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gcnllr-services"
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gcnllr-services")
+target_compile_features(gcnllr-native-gx PRIVATE cxx_std_20)
+target_compile_definitions(gcnllr-native-gx PRIVATE GC_WII_GX_WII=$<BOOL:${GC_WII_GX_WII}>)
+target_compile_definitions(gcnllr-native-gx PRIVATE GCNLLR_RETAIL_PIPELINE=$<STREQUAL:${GCNLLR_RENDER_PIPELINE},retail>)
+target_compile_definitions(gcnllr-native-gx PRIVATE GCNLLR_NATIVE_PIPELINE=$<BOOL:${GCNLLR_NATIVE_PIPELINE}>
+  GCNLLR_PERSISTENT_GEOMETRY=$<BOOL:${GCNLLR_PERSISTENT_GEOMETRY}>)
+target_compile_definitions(gcnllr-native-gx PRIVATE GCNLLR_NATIVE_DRAW_SINK=$<BOOL:${GCNLLR_NATIVE_DRAW_SINK}>)
+target_compile_definitions(gcnllr-native-gx PRIVATE GCNLLR_DIRECT_DISPLAY_COPY=$<BOOL:${GCNLLR_DIRECT_DISPLAY_COPY}>)
+target_compile_definitions(gcnllr-native-gx PRIVATE
+  GCNLLR_GPU_OWNED_DISPLAY=$<BOOL:${GCNLLR_GPU_OWNED_DISPLAY}>
+  GCNLLR_GPU_OWNED_TEXTURES=$<BOOL:${GCNLLR_GPU_OWNED_TEXTURES}>
+  GCNLLR_GPU_FRAME_PACKETS=$<BOOL:${GCNLLR_GPU_FRAME_PACKETS}>
+  GCNLLR_GX_ONE_COPY=$<BOOL:${GCNLLR_GX_ONE_COPY}>)
+target_compile_definitions(gcnllr-native-gx PRIVATE GCNLLR_GX_FIFO_WORKER=$<BOOL:${GCNLLR_GX_FIFO_WORKER}>
+  GCNLLR_GX_COOPERATIVE_VI=$<BOOL:${GCNLLR_GX_COOPERATIVE_VI}>
+  GCNLLR_ASYNC_COPIES=$<BOOL:${GCNLLR_ASYNC_COPIES}>
+  GCNLLR_COMPOSED_SCANOUT=$<BOOL:${GCNLLR_COMPOSED_SCANOUT}>
+  GCNLLR_BATCHED_SUBMISSION=$<BOOL:${_gcnllr_batched_submission}>
+  GCNLLR_OWNED_COMPLETION=$<STREQUAL:${GCNLLR_GX_COMPLETION},owned>
+  GCNLLR_QUEUED_PRESENT=$<STREQUAL:${GCNLLR_GX_SUBMISSION},queued>)
+set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/texture_readback.cpp" TARGET_DIRECTORY aurora_gx
+  APPEND PROPERTY COMPILE_DEFINITIONS GCNLLR_ASYNC_COPIES=$<BOOL:${GCNLLR_ASYNC_COPIES}>)
+target_include_directories(gcnllr-native-gx PRIVATE "${GC_WII_GX_ROOT}/include" "${GXRUNTIME_DIR}/graphics/aurora/lib")
+target_link_libraries(gcnllr-native-gx PRIVATE
+  aurora::core aurora::gx aurora::vi aurora::pad aurora::si
+  absl::flat_hash_map)
+if(GCNLLR_RENDER_PIPELINE STREQUAL "packet")
+  target_link_libraries(gcnllr-native-gx PRIVATE GXRuntime::retail_gx_frontend GXRuntime::gxcore)
+else()
+  # Shared address/type declarations do not instantiate the legacy packet
+  # frontend, trace decoder, or GXCore state/vertex preparation owner.
+  target_include_directories(gcnllr-native-gx PRIVATE "${GXRUNTIME_DIR}/include" "${GXRUNTIME_DIR}/graphics/gxcore/include")
+  if(GCNLLR_GX_FIFO_WORKER OR GCNLLR_NATIVE_DRAW_SINK)
+    message(FATAL_ERROR "Native Aurora owns command/resource preparation on the machine thread")
+  endif()
+endif()
+if(WIN32)
+  target_link_libraries(gcnllr-native-gx PRIVATE avrt user32)
+  add_custom_command(TARGET gcnllr-native-gx POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      $<TARGET_RUNTIME_DLLS:gcnllr-native-gx> $<TARGET_FILE_DIR:gcnllr-native-gx>
+    COMMAND_EXPAND_LISTS)
+endif()
+
+# Dawn loads DXC lazily; TARGET_RUNTIME_DLLS does not include these imports.
+if(WIN32 AND GCNLLR_GPU_BACKEND STREQUAL "d3d12")
+  set(GC_WII_DXC_RUNTIME_DIR "" CACHE PATH "Pinned Dawn DXC runtime DLL directory")
+  foreach(_dxc dxil.dll dxcompiler.dll)
+    if(NOT EXISTS "${GC_WII_DXC_RUNTIME_DIR}/${_dxc}")
+      message(FATAL_ERROR "D3D12 requires ${_dxc} in GC_WII_DXC_RUNTIME_DIR")
+    endif()
+    add_custom_command(TARGET gcnllr-native-gx POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${GC_WII_DXC_RUNTIME_DIR}/${_dxc}" "$<TARGET_FILE_DIR:gcnllr-native-gx>" VERBATIM)
+  endforeach()
+endif()

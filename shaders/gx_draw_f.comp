@@ -1,0 +1,1506 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+// Exact compute differential for the thirty fused IPL/Wind-Waker pixel
+// programs A--AD.  Textured programs accept only the host-validated resident
+// formats; the host rejects every other format before dispatch.  Programs
+// F/J/M/P/T/Y/Z/AA/AB/AC/AD have no texture dependency at all (texgens==0);
+// W samples a texture the combiner never references, so it skips the fetch
+// (identical output).
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0, r32ui) uniform uimage2D efb_color;
+layout(set = 0, binding = 1, r32ui) uniform uimage2D efb_depth;
+layout(set = 0, binding = 3, std430) readonly buffer DrawJob {
+    uint words[];
+} job;
+layout(set = 0, binding = 4, std430) readonly buffer TextureData {
+    uint words[];
+} texture_data;
+// Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): binding for the
+// TLUT bytes C4/C8 palette decode needs. Layout mirrors TextureData (a flat
+// packed-byte word arena). binding=6, NOT 5 -- binding=5 in this shared
+// descriptor set is already EFB_TEX_SHADOW (gx_vulkan.c's efb_tex_output);
+// pass B's first draft wrongly declared this at binding=5, which would have
+// silently aliased that buffer instead of real TLUT bytes. Fixed in pass C
+// alongside wiring the real upload (gx_vulkan.c's TLUT_SHADOW_OFFSET/BYTES,
+// words 251..255).
+layout(set = 0, binding = 6, std430) readonly buffer TlutData {
+    uint words[];
+} tlut_data;
+// Pass D root-cause hunt (docs/GX_GENERAL_TEV.md): permanent, always-armable
+// per-pixel debug dump for shade_pixel_general. Written only when (x,y)
+// equals draw_push.dbg_x/dbg_y (default -1,-1, matching no real pixel), so
+// the cost when unarmed is one integer compare per invocation. See
+// gx_vk_dump_general_debug (gx_vulkan.c) for the word layout and printer.
+layout(set = 0, binding = 7, std430) buffer DebugData {
+    uint words[];
+} gen_debug;
+layout(push_constant) uniform DrawPush {
+    uint word_base;
+    uint batch_mode;
+    uint tile_header_base;
+    uint tile_index_base;
+    int dbg_x;
+    int dbg_y;
+} draw_push;
+
+uint current_word_base;
+uint jw(uint index) { return job.words[current_word_base + index]; }
+int si(uint index) { return int(jw(index)); }
+float sf(uint index) { return uintBitsToFloat(jw(index)); }
+
+float slope_value(uint base, int x, int y) {
+    precise float dx = sf(base + 5u) + float(x - si(base + 3u));
+    precise float dy = sf(base + 6u) + float(y - si(base + 4u));
+    precise float xterm = sf(base + 1u) * dx;
+    precise float value = sf(base) + xterm;
+    precise float yterm = sf(base + 2u) * dy;
+    value = value + yterm;
+    return value;
+}
+
+uint color_byte(uint slope_base, int x, int y) {
+    float value = slope_value(slope_base, x, y);
+    return uint(int(value < 0.0 ? 0.0 : value > 255.0 ? 255.0 : value));
+}
+
+// Pass E (docs/GX_GENERAL_TEV.md, root-caused in pass D): Vulkan/SPIR-V FDiv
+// is only guaranteed accurate to ~2.5 ULP, while gx_raster.c's CPU reference
+// executes a single x86 DIVSS/DIVSD, which IS correctly rounded (IEEE 754
+// mandates correctly-rounded basic division on x86). Pass D's instrumented
+// per-pixel dump proved this gap is real, not theoretical: for BIT-IDENTICAL
+// input wraw=0x36F61463, CPU's `1.0f/wraw` gave 0x480528FF while GPU's plain
+// `1.0/wraw` (even `precise`-qualified -- precise controls evaluation order,
+// not a single division instruction's rounding) gave 0x48052900, a 1-ULP
+// difference that flipped an int() truncation boundary (3656 vs 3655) and
+// ultimately a stored pixel byte after dithering (corun pixel (142,90),
+// sync 1020, frame 969).
+//
+// `precise fma()`, unlike `/`, IS specified as a true, single-rounding fused
+// multiply-add (no intermediate rounding of a*b before adding c) -- so a
+// Newton-Raphson + Markstein refinement built entirely from fma() calls can
+// reconstruct the correctly-rounded fp32 reciprocal/quotient from a merely
+// ~2.5-ULP seed, matching x86 DIVSS bit-for-bit. This is a standard
+// technique (see e.g. Markstein, "IA-64 and Elementary Functions"); it is
+// NOT a fudge factor -- it recomputes the same well-defined mathematical
+// result to full IEEE precision, it does not special-case any input.
+precise float exact_rcp(float b) {
+    precise float y = 1.0 / b;           // seed: hardware divide, ~2.5 ULP
+    precise float e = fma(-b, y, 1.0);    // residual of b*y-1, exact (fma)
+    y = fma(y, e, y);                     // Newton step
+    e = fma(-b, y, 1.0);
+    y = fma(y, e, y);                     // Markstein step -> correctly rounded
+    return y;
+}
+// exact_div(a,b): CPU's `invW / q` (gx_raster.c build_block) is a genuine
+// one-shot DIVSS(a,b), not a reciprocal-then-multiply -- so this mirrors
+// that shape (a true quotient), built from exact_rcp(b) rather than a raw
+// GPU '/' seed, then one more fma-based Newton correction on the quotient.
+precise float exact_div(float a, float b) {
+    precise float rb = exact_rcp(b);
+    precise float y = a * rb;             // seed quotient
+    precise float e = fma(-b, y, a);       // exact remainder a-b*y (fma)
+    y = fma(e, rb, y);                     // correction -> correctly rounded
+    return y;
+}
+
+precise vec2 texture_uv(int x, int y) {
+    precise float inv_w = exact_rcp(slope_value(51u, x, y));
+    precise float q = slope_value(72u, x, y) * inv_w;
+    precise float projection = inv_w;
+    if (q != 0.0)
+        projection = exact_div(inv_w, q);
+    precise float u = slope_value(58u, x, y) * projection;
+    precise float v = slope_value(65u, x, y) * projection;
+    return vec2(u, v);
+}
+
+int fixed_log2(float value) {
+    uint bits = floatBitsToUint(value);
+    return int((bits & 0x7f800000u) >> 19) - 2032 +
+           int((bits & 0x007fffffu) >> 19);
+}
+
+bool texture_linear(int bx, int by) {
+    precise vec2 uv00 = texture_uv(bx, by);
+    precise vec2 uv10 = texture_uv(bx + 1, by);
+    precise vec2 uv01 = texture_uv(bx, by + 1);
+    precise float dudx = abs(uv00.x - uv10.x);
+    precise float dvdx = abs(uv00.y - uv10.y);
+    precise float dudy = abs(uv00.x - uv01.x);
+    precise float dvdy = abs(uv00.y - uv01.y);
+    precise float s_delta;
+    precise float t_delta;
+    if (jw(86u) != 0u) {
+        s_delta = dudx + dudy;
+        t_delta = dvdx + dvdy;
+    } else {
+        s_delta = max(dudx, dudy);
+        t_delta = max(dvdx, dvdy);
+    }
+    int lod = fixed_log2(max(s_delta, t_delta));
+    lod += si(87u);
+    return (lod > 0 && jw(85u) == 1u) ||
+           (lod <= 0 && jw(84u) == 1u);
+}
+
+int wrap_coord(int coord, uint mode, int size) {
+    if (mode == 0u)
+        return clamp(coord, 0, size - 1);
+    if (mode == 1u)
+        return coord & (size - 1);
+    if ((coord & size) != 0)
+        coord = ~coord;
+    return coord & (size - 1);
+}
+
+uint load_texture_u8(uint offset) {
+    if (offset >= jw(90u))
+        return 0u;
+    uint packed = texture_data.words[(jw(99u) + offset) >> 2];
+    return (packed >> ((offset & 3u) * 8u)) & 0xffu;
+}
+
+uvec4 decode_texture(int s, int t) {
+    uint ss = uint(s), tt = uint(t);
+    uint format = jw(79u);
+    if (format == 0u) {
+        uint width_blocks = (jw(80u) + 7u) >> 3;
+        uint base = ((tt >> 3) * width_blocks + (ss >> 3)) << 5;
+        uint packed = load_texture_u8(base + ((tt & 7u) << 2) + ((ss & 7u) >> 1));
+        uint i = ((ss & 1u) == 0u ? packed >> 4 : packed) & 0xfu;
+        i = (i << 4) | i;
+        return uvec4(i);
+    }
+    if (format == 6u) {
+        uint width_blocks = (jw(80u) + 3u) >> 2;
+        uint base = ((tt >> 2) * width_blocks + (ss >> 2)) << 6;
+        uint index = ((tt & 3u) << 2) + (ss & 3u);
+        uint a = load_texture_u8(base + index * 2u);
+        uint r = load_texture_u8(base + index * 2u + 1u);
+        uint g = load_texture_u8(base + 32u + index * 2u);
+        uint b = load_texture_u8(base + 32u + index * 2u + 1u);
+        return uvec4(r, g, b, a);
+    }
+    uint width_blocks = (jw(80u) + 7u) >> 3;
+    uint base = ((tt >> 2) * width_blocks + (ss >> 3)) << 5;
+    uint i = load_texture_u8(base + ((tt & 3u) << 3) + (ss & 7u));
+    return uvec4(i);
+}
+
+uvec4 sample_texture(int s, int t, bool linear) {
+    int width = int(jw(80u));
+    int height = int(jw(81u));
+    if (!linear) {
+        int is = wrap_coord(s >> 7, jw(82u), width);
+        int it = wrap_coord(t >> 7, jw(83u), height);
+        return decode_texture(is, it);
+    }
+
+    s -= 64;
+    t -= 64;
+    int is = s >> 7;
+    int it = t >> 7;
+    int is1 = is + 1;
+    int it1 = it + 1;
+    int fs = s & 0x7f;
+    int ft = t & 0x7f;
+    is = wrap_coord(is, jw(82u), width);
+    it = wrap_coord(it, jw(83u), height);
+    is1 = wrap_coord(is1, jw(82u), width);
+    it1 = wrap_coord(it1, jw(83u), height);
+    uvec4 v00 = decode_texture(is, it);
+    uvec4 v10 = decode_texture(is1, it);
+    uvec4 v01 = decode_texture(is, it1);
+    uvec4 v11 = decode_texture(is1, it1);
+    uvec4 acc = v00 * uint((128 - fs) * (128 - ft)) +
+                v10 * uint(fs * (128 - ft)) +
+                v01 * uint((128 - fs) * ft) +
+                v11 * uint(fs * ft);
+    return acc >> 14;
+}
+
+int signed16(int value) {
+    uint low = uint(value) & 0xffffu;
+    return low >= 0x8000u ? int(low) - 0x10000 : int(low);
+}
+
+uint clamp255_s16(int value) {
+    return uint(clamp(signed16(value), 0, 255));
+}
+
+int clamp1024_s16(int value) {
+    int narrowed = int(value << 16) >> 16;
+    return clamp(narrowed, -1024, 1023);
+}
+
+uint modulate(uint value, uint factor) {
+    uint cc = factor + (factor >> 7);
+    return clamp255_s16(int(value * cc + 128u) >> 8);
+}
+
+uint modulate2(uint value, uint factor) {
+    uint cc = factor + (factor >> 7);
+    return clamp255_s16(int(value * cc * 2u + 128u) >> 8);
+}
+
+uint core_c_channel(uint texel, int reg_value) {
+    int c = int(texel + (texel >> 7));
+    int value = (reg_value * c) << 1;
+    value = (value + 128) >> 8;
+    return clamp255_s16(value);
+}
+
+uint program_e_channel(uint texel, int reg1, int reg2) {
+    int c = int(texel + (texel >> 7));
+    int value = (reg2 << 8) + c * (reg1 - reg2);
+    value = ((value << 1) + 128) >> 8;
+    return clamp255_s16(value);
+}
+
+uint expand6(uint value) { return (value << 2) | (value >> 4); }
+
+uvec4 get_abgr(uint packed, uint pixel_format) {
+    if (pixel_format == 1u) {
+        return uvec4(expand6(packed & 0x3fu),
+                     expand6((packed >> 6) & 0x3fu),
+                     expand6((packed >> 12) & 0x3fu),
+                     expand6((packed >> 18) & 0x3fu));
+    }
+    return uvec4(255u, packed & 0xffu, (packed >> 8) & 0xffu,
+                 (packed >> 16) & 0xffu);
+}
+
+// ============================================================================
+// Phase 1a General TEV program (id 31), docs/GX_GENERAL_TEV.md. DEAD CODE:
+// compute_program_id (gx_raster.c:4015) never classifies a draw to 31 yet
+// (pass C). Every function below is a line-for-line GLSL transcription of
+// its named gx_raster.c counterpart, reading the words-112..255 general
+// block packed by snapshot_fused_draw (gx_vulkan.c) instead of re-deriving
+// per-draw-constant state from s_bp -- the CPU already decoded what it could
+// (tev_reg[4][4], color[1]/tex[1] slopes) into dedicated words; everything
+// else is the RAW BP register window, decoded here exactly as the CPU's
+// build_draw_cfg (gx_raster.c:5660-5755) or the per-pixel functions
+// (color_arg/alpha_arg/draw_color_*/draw_alpha_*/alpha_test/BlendTev chain)
+// already do, so every bitfield extraction below cites the exact source.
+// ============================================================================
+
+// bits()/sext(bits()) (gx_raster.c:350-354). GLSL bitfieldExtract already
+// zero-extends (uint) or sign-extends from the topmost extracted bit (int),
+// which is exactly bits()'s and sext(bits())'s behavior respectively.
+uint ubits(uint v, uint pos, uint n) { return bitfieldExtract(v, int(pos), int(n)); }
+int  sbits(uint v, uint pos, uint n) { return bitfieldExtract(int(v), int(pos), int(n)); }
+
+uint expand5(uint v) { return (v << 3) | (v >> 2); }   // Convert5To8 (gx_raster.c:374)
+uint expand4(uint v) { return (v << 4) | v; }          // Convert4To8 (gx_raster.c:373)
+uint expand3(uint v) { return (v << 5) | (v << 2) | (v >> 1); } // Convert3To8 (gx_raster.c:372)
+// expand6 (Convert6To8) already defined above for the RGBA6_Z24 EFB decode.
+
+struct GenColor { int r, g, b, a; };
+
+// tev_load_registers (gx_raster.c:1716-1732), Konst half only -- Reg[4][4] is
+// already CPU-decoded at words 161..176 (job->tev_reg), so this only derives
+// Konst[4] from the raw register bank (words 177..184, BP 0xE0-0xE7).
+void gen_load_konst(out GenColor konst[4]) {
+    for (int i = 0; i < 4; ++i) { konst[i].r = 0; konst[i].g = 0; konst[i].b = 0; konst[i].a = 0; }
+    for (uint num = 0u; num < 4u; ++num) {
+        uint ra = jw(177u + num * 2u);
+        uint bg = jw(177u + num * 2u + 1u);
+        int red = sbits(ra, 0u, 11u);
+        int alp = sbits(ra, 12u, 11u);
+        int blu = sbits(bg, 0u, 11u);
+        int grn = sbits(bg, 12u, 11u);
+        bool ra_const = ubits(ra, 23u, 1u) != 0u;
+        bool bg_const = ubits(bg, 23u, 1u) != 0u;
+        if (ra_const) { konst[num].r = red; konst[num].a = alp; }
+        if (bg_const) { konst[num].g = grn; konst[num].b = blu; }
+    }
+}
+
+// konst_lookup (gx_raster.c:1660-1670).
+GenColor gen_konst_lookup(GenColor konst[4], uint sel) {
+    const int fixedv[8] = int[8](255, 223, 191, 159, 128, 96, 64, 32);
+    GenColor c;
+    if (sel < 8u) { c.r = fixedv[sel]; c.g = c.r; c.b = c.r; c.a = c.r; return c; }
+    if (sel < 12u) { c.r = 0; c.g = 0; c.b = 0; c.a = 0; return c; }
+    if (sel < 16u) { GenColor k = konst[sel - 12u]; c.r = k.r; c.g = k.g; c.b = k.b; c.a = 0; return c; }
+    if (sel < 20u) { int v = konst[sel - 16u].r; c.r = v; c.g = v; c.b = v; c.a = v; return c; }
+    if (sel < 24u) { int v = konst[sel - 20u].g; c.r = v; c.g = v; c.b = v; c.a = v; return c; }
+    if (sel < 28u) { int v = konst[sel - 24u].b; c.r = v; c.g = v; c.b = v; c.a = v; return c; }
+    { int v = konst[sel - 28u].a; c.r = v; c.g = v; c.b = v; c.a = v; return c; }
+}
+
+// swap_table (gx_raster.c:1706-1714). id 0..3 -> [red<-,green<-,blue<-,alpha<-]
+// channel-select indices, read from the same raw words that also carry
+// kcsel/kasel (words 153..160, BP 0xF6-0xFD; both views of the same physical
+// AllTevKSels registers -- see the packer comment for the dual-addressing
+// derivation).
+void gen_swap_table(uint id, out uint idx[4]) {
+    uint rg = jw(153u + id * 2u);
+    uint ba = jw(153u + id * 2u + 1u);
+    idx[0] = ubits(rg, 0u, 2u);
+    idx[1] = ubits(rg, 2u, 2u);
+    idx[2] = ubits(ba, 0u, 2u);
+    idx[3] = ubits(ba, 2u, 2u);
+}
+
+// color_arg (gx_raster.c:1673-1692).
+void gen_color_arg(GenColor reg[4], GenColor texc, GenColor rasc, GenColor sk, uint arg,
+                    out int r, out int g, out int b) {
+    if (arg == 0u)       { r = reg[0].r; g = reg[0].g; b = reg[0].b; }
+    else if (arg == 1u)  { r = reg[0].a; g = reg[0].a; b = reg[0].a; }
+    else if (arg == 2u)  { r = reg[1].r; g = reg[1].g; b = reg[1].b; }
+    else if (arg == 3u)  { r = reg[1].a; g = reg[1].a; b = reg[1].a; }
+    else if (arg == 4u)  { r = reg[2].r; g = reg[2].g; b = reg[2].b; }
+    else if (arg == 5u)  { r = reg[2].a; g = reg[2].a; b = reg[2].a; }
+    else if (arg == 6u)  { r = reg[3].r; g = reg[3].g; b = reg[3].b; }
+    else if (arg == 7u)  { r = reg[3].a; g = reg[3].a; b = reg[3].a; }
+    else if (arg == 8u)  { r = texc.r; g = texc.g; b = texc.b; }
+    else if (arg == 9u)  { r = texc.a; g = texc.a; b = texc.a; }
+    else if (arg == 10u) { r = rasc.r; g = rasc.g; b = rasc.b; }
+    else if (arg == 11u) { r = rasc.a; g = rasc.a; b = rasc.a; }
+    else if (arg == 12u) { r = 255; g = 255; b = 255; }
+    else if (arg == 13u) { r = 128; g = 128; b = 128; }
+    else if (arg == 14u) { r = sk.r; g = sk.g; b = sk.b; }
+    else                 { r = 0; g = 0; b = 0; }
+}
+
+// alpha_arg (gx_raster.c:1693-1704).
+int gen_alpha_arg(GenColor reg[4], GenColor texc, GenColor rasc, GenColor sk, uint arg) {
+    if (arg == 0u) return reg[0].a;
+    if (arg == 1u) return reg[1].a;
+    if (arg == 2u) return reg[2].a;
+    if (arg == 3u) return reg[3].a;
+    if (arg == 4u) return texc.a;
+    if (arg == 5u) return rasc.a;
+    if (arg == 6u) return sk.a;
+    return 0;
+}
+
+const int GEN_BIAS[4]   = int[4](0, 128, -128, 0);   // s_Bias   (gx_raster.c:1646)
+const int GEN_LSHIFT[4] = int[4](0, 1, 2, 0);        // s_LShift (gx_raster.c:1647)
+const int GEN_RSHIFT[4] = int[4](0, 0, 0, 1);        // s_RShift (gx_raster.c:1648)
+
+// draw_color_regular (gx_raster.c:1740-1766). inA/inB/inC/inD indexed
+// [ALP_C=0,BLU_C=1,GRN_C=2,RED_C=3] exactly like the C temp arrays; only
+// indices 1..3 (BLU/GRN/RED) are read here, matching the C loop bound.
+void gen_draw_color_regular(inout GenColor reg[4], uint bias, uint op, uint clampMode, uint scale, uint dest,
+                             int inA[4], int inB[4], int inC[4], int inD[4]) {
+    int rr = 0, gg = 0, bb = 0;
+    for (int i = 1; i <= 3; ++i) {
+        uint uc = uint(inC[i]) + (uint(inC[i]) >> 7);
+        int cc = int(uc);
+        int temp = inA[i] * (256 - cc) + inB[i] * cc;
+        temp <<= GEN_LSHIFT[scale];
+        temp += (scale == 3u) ? 0 : ((op != 0u) ? 127 : 128);
+        temp >>= 8;
+        temp = (op != 0u) ? -temp : temp;
+        int result = ((inD[i] + GEN_BIAS[bias]) << GEN_LSHIFT[scale]) + temp;
+        result >>= GEN_RSHIFT[scale];
+        if (i == 1) bb = result; else if (i == 2) gg = result; else rr = result;
+    }
+    if (clampMode != 0u) {
+        reg[dest].r = int(clamp255_s16(rr));
+        reg[dest].g = int(clamp255_s16(gg));
+        reg[dest].b = int(clamp255_s16(bb));
+    } else {
+        reg[dest].r = clamp1024_s16(rr);
+        reg[dest].g = clamp1024_s16(gg);
+        reg[dest].b = clamp1024_s16(bb);
+    }
+}
+
+// draw_color_compare (gx_raster.c:1767-1790). NOTE the deliberate asymmetry
+// with the regular path: when clampMode==0 here there is NO clamp1024 else
+// branch -- the raw (s16)-truncated value is left as-is, unclamped.
+void gen_draw_color_compare(inout GenColor reg[4], uint mode, uint cmp, uint clampMode, uint dest,
+                             int inA[4], int inB[4], int inC[4], int inD[4]) {
+    int rr = 0, gg = 0, bb = 0;
+    for (int i = 1; i <= 3; ++i) {
+        // gx_raster.c declares these `u32 a, b;` -- assigning a (possibly
+        // negative) s32 register value reinterprets the bit pattern, and the
+        // == / > compares that follow are UNSIGNED. Brute-force-caught bug:
+        // an earlier draft used signed int here and diverged whenever an
+        // operand's top bit was set.
+        uint a, b;
+        if (mode == 0u)      { a = uint(inA[3]); b = uint(inB[3]); }
+        else if (mode == 1u) { a = (uint(inA[2]) << 8) | uint(inA[3]);
+                                b = (uint(inB[2]) << 8) | uint(inB[3]); }
+        else if (mode == 2u) { a = (uint(inA[1]) << 16) | (uint(inA[2]) << 8) | uint(inA[3]);
+                                b = (uint(inB[1]) << 16) | (uint(inB[2]) << 8) | uint(inB[3]); }
+        else                 { a = uint(inA[i]); b = uint(inB[i]); }
+        int add = (cmp != 0u) ? ((a == b) ? inC[i] : 0) : ((a > b) ? inC[i] : 0);
+        int res = signed16(inD[i] + add);
+        if (i == 1) bb = res; else if (i == 2) gg = res; else rr = res;
+    }
+    reg[dest].b = bb; reg[dest].g = gg; reg[dest].r = rr;
+    if (clampMode != 0u) {
+        reg[dest].r = int(clamp255_s16(reg[dest].r));
+        reg[dest].g = int(clamp255_s16(reg[dest].g));
+        reg[dest].b = int(clamp255_s16(reg[dest].b));
+    }
+}
+
+// draw_alpha_regular (gx_raster.c:1791-1803). NOTE the op/shift order differs
+// from the color path on purpose: negate-then-shift here vs shift-then-negate
+// there -- both transcribed exactly as the C source orders them.
+void gen_draw_alpha_regular(inout GenColor reg[4], uint bias, uint op, uint clampMode, uint scale, uint dest,
+                             int a, int b, int c, int d) {
+    uint uc = uint(c) + (uint(c) >> 7);
+    int cc = int(uc);
+    int temp = a * (256 - cc) + b * cc;
+    temp <<= GEN_LSHIFT[scale];
+    temp += (scale == 3u) ? 0 : ((op != 0u) ? 127 : 128);
+    temp = (op != 0u) ? (-temp >> 8) : (temp >> 8);
+    int result = ((d + GEN_BIAS[bias]) << GEN_LSHIFT[scale]) + temp;
+    result >>= GEN_RSHIFT[scale];
+    reg[dest].a = signed16(result);
+    reg[dest].a = (clampMode != 0u) ? int(clamp255_s16(reg[dest].a)) : clamp1024_s16(reg[dest].a);
+}
+
+// draw_alpha_compare (gx_raster.c:1804-1817). inA/inB are the SAME color-arg
+// arrays draw_color_compare saw (tev_draw passes them through unchanged) --
+// modes 0..2 read the color args' R/G/B slots, only mode 3 (default) reads
+// the alpha slot (index 0).
+void gen_draw_alpha_compare(inout GenColor reg[4], uint mode, uint cmp, uint clampMode, uint dest,
+                             int inA[4], int inB[4], int c, int d) {
+    uint a, b;   // gx_raster.c: `u32 a, b;` -- unsigned compare, see the color-compare comment above.
+    if (mode == 0u)      { a = uint(inA[3]); b = uint(inB[3]); }
+    else if (mode == 1u) { a = (uint(inA[2]) << 8) | uint(inA[3]);
+                            b = (uint(inB[2]) << 8) | uint(inB[3]); }
+    else if (mode == 2u) { a = (uint(inA[1]) << 16) | (uint(inA[2]) << 8) | uint(inA[3]);
+                            b = (uint(inB[1]) << 16) | (uint(inB[2]) << 8) | uint(inB[3]); }
+    else                 { a = uint(inA[0]); b = uint(inB[0]); }
+    int add = (cmp != 0u) ? ((a == b) ? c : 0) : ((a > b) ? c : 0);
+    reg[dest].a = signed16(d + add);
+    reg[dest].a = (clampMode != 0u) ? int(clamp255_s16(reg[dest].a)) : clamp1024_s16(reg[dest].a);
+}
+
+// alpha_test / alpha_cmp (gx_raster.c:1819-1843). CMP_* enum (gx_raster.c:975)
+// NEVER=0,LESS=1,EQUAL=2,LEQUAL=3,GREATER=4,NEQUAL=5,GEQUAL=6,ALWAYS=7.
+bool gen_alpha_cmp(int alpha, int ref, uint comp) {
+    if (comp == 7u) return true;
+    if (comp == 0u) return false;
+    if (comp == 3u) return alpha <= ref;
+    if (comp == 1u) return alpha < ref;
+    if (comp == 6u) return alpha >= ref;
+    if (comp == 4u) return alpha > ref;
+    if (comp == 2u) return alpha == ref;
+    if (comp == 5u) return alpha != ref;
+    return true;
+}
+bool gen_alpha_test(int alpha) {
+    uint at = jw(185u);   // raw BP 0xF3
+    bool c0 = gen_alpha_cmp(alpha, int(ubits(at, 0u, 8u)), ubits(at, 16u, 3u));
+    bool c1 = gen_alpha_cmp(alpha, int(ubits(at, 8u, 8u)), ubits(at, 19u, 3u));
+    uint logic = ubits(at, 22u, 2u);
+    if (logic == 0u) return c0 && c1;
+    if (logic == 1u) return c0 || c1;
+    if (logic == 2u) return c0 != c1;
+    return !(c0 != c1);
+}
+
+// fog_float (gx_raster.c:1888-1895): GX's 11e8m custom float encoding ->
+// IEEE754 fp32 bit reconstruction. Pure integer bit manipulation, no
+// rounding hazard.
+float fog_float_g(uint word) {
+    uint raw = (((word >> 19u) & 1u) << 31) | (((word >> 11u) & 0xffu) << 23) |
+               ((word & 0x7ffu) << 12);
+    return uintBitsToFloat(raw);
+}
+
+// apply_fog (gx_raster.c:1926-1996), phase 1b (docs/GX_GENERAL_TEV.md).
+// Blends B/G/R only, never alpha (matches the C reference exactly -- there
+// is no fourth output[ALP_C] write in apply_fog). `zval` is always the plain
+// interpolated depth: the eligibility gate excludes z-texture, so
+// ztexture_depth's op==0 passthrough (gx_raster.c:1897-1900) is the only
+// reachable case -- this never re-derives depth from RawTexColor. fsel 1/3
+// are excluded by the eligibility gate (gx_raster.c's TRAPF path, a
+// software bug we don't port); every other 3-bit fsel value is handled
+// exactly as apply_fog's own control flow reaches it (0=no-op, 2=linear via
+// the switch's default no-transform case, 4-7=exp2 family).
+void gen_apply_fog(inout int out_r, inout int out_g, inout int out_b,
+                    int x, int y, uint zval) {
+    uint f3 = jw(265u);              // raw BP 0xF1 (word 256+9)
+    uint fsel = ubits(f3, 21u, 3u);
+    if (fsel == 0u) return;
+
+    uint a_word = jw(262u);           // raw BP 0xEE (word 256+6)
+    uint c_word = f3;
+    float a = fog_float_g(a_word);
+    float c = fog_float_g(c_word);
+    if (((a_word >> 11u) & 0xffu) == 0xffu && ((c_word >> 11u) & 0xffu) == 0xffu) {
+        a = 0.0;
+        bool neg = ((a_word & (1u << 19)) == 0u) && ((c_word & (1u << 19)) == 0u);
+        c = neg ? uintBitsToFloat(0xff800000u) : uintBitsToFloat(0x7f800000u);
+    }
+
+    precise float ze;
+    if (ubits(f3, 20u, 1u) == 0u) {
+        uint shift = jw(264u) & 31u;                    // raw BP 0xF0
+        int denom = int(jw(263u) & 0x00ffffffu) - int(zval >> shift);  // raw BP 0xEF
+        if (denom != 0)
+            ze = exact_div(a * 16777216.0, float(denom));
+        else
+            ze = (a < 0.0) ? uintBitsToFloat(0xff800000u) : uintBitsToFloat(0x7f800000u);
+    } else {
+        ze = a * float(zval) * (1.0 / 16777216.0);   // exact power-of-2 scale, no ULP risk
+    }
+
+    uint range_base = jw(256u);       // raw BP 0xE8
+    if (ubits(range_base, 10u, 1u) != 0u) {
+        float vp_width = abs(sf(267u) * 2.0);   // word 267: raw XF 0x101a (vp_wd())
+        if (vp_width > 0.0) {
+            precise float center = float(int(ubits(range_base, 0u, 10u)) - 342);
+            precise float screen_center = exact_div(center, vp_width) * 2.0 - 1.0;
+            precise float off = 2.0 * exact_div(float(x), vp_width) - 1.0 - screen_center;
+            float findex = 9.0 - abs(off) * 9.0;
+            findex = clamp(findex, 0.0, 9.0);
+            uint lo = uint(findex);
+            uint hi = (lo < 9u) ? lo + 1u : 9u;
+            uint lo_word = jw(257u + lo / 2u);   // raw BP 0xE9 + lo/2 (word 257+..)
+            uint hi_word = jw(257u + hi / 2u);
+            float klo = float(ubits(lo_word, (lo & 1u) != 0u ? 0u : 12u, 12u)) / 64.0;
+            float khi = float(ubits(hi_word, (hi & 1u) != 0u ? 0u : 12u, 12u)) / 64.0;
+            float frac = findex - float(lo);
+            float k = klo + (khi - klo) * frac;
+            if (k != 0.0)
+                ze *= exact_div(sqrt(off * off + k * k), k);
+        }
+    }
+
+    float fog = ze - c;
+    fog = clamp(fog, 0.0, 1.0);
+    if (fsel == 4u) fog = 1.0 - exp2(-8.0 * fog);
+    else if (fsel == 5u) fog = 1.0 - exp2(-8.0 * fog * fog);
+    else if (fsel == 6u) fog = exp2(-8.0 * (1.0 - fog));
+    else if (fsel == 7u) { fog = 1.0 - fog; fog = exp2(-8.0 * fog * fog); }
+
+    // iround (gx_raster.c:3522): round-half-up, NOT round-to-nearest-even --
+    // int() truncates toward zero, so replicate the C `(x-t)>=0.5f` bump
+    // exactly rather than using GLSL round()/roundEven().
+    float fx = fog * 256.0;
+    int ifog = int(fx);
+    if (fx - float(ifog) >= 0.5) ifog += 1;
+
+    uint fog_color = jw(266u);        // raw BP 0xF2
+    int fb = int(ubits(fog_color, 0u, 8u));
+    int fg = int(ubits(fog_color, 8u, 8u));
+    int fr = int(ubits(fog_color, 16u, 8u));
+    // (u8) truncation, matching the C reference's implicit narrowing cast
+    // exactly (mod-256, including any wraparound if ifog ever strays
+    // outside its normal ~0..256 range).
+    out_b = int(uint((out_b * (256 - ifog) + fb * ifog) >> 8) & 0xffu);
+    out_g = int(uint((out_g * (256 - ifog) + fg * ifog) >> 8) & 0xffu);
+    out_r = int(uint((out_r * (256 - ifog) + fr * ifog) >> 8) & 0xffu);
+}
+
+// decode_tlut_pixel (gx_raster.c:1148-1179). tlutfmt 0=IA8,1=RGB565,2=RGB5A3.
+// TLUT bytes come from the tlut_data SSBO (binding=5); arena_word names the
+// per-slot word holding this draw's byte offset into it (words 252/254, see
+// shade_pixel_general). Pass C still needs to wire the real upload/offsets.
+uint load_tlut_u8(uint arena_word, uint offset) {
+    uint packed = tlut_data.words[(jw(arena_word) + offset) >> 2u];
+    return (packed >> ((offset & 3u) * 8u)) & 0xffu;
+}
+uvec4 decode_tlut_pixel_g(uint arena_word, uint entry_offset, uint tlutfmt) {
+    if (tlutfmt == 0u) {
+        uint a = load_tlut_u8(arena_word, entry_offset);
+        uint i = load_tlut_u8(arena_word, entry_offset + 1u);
+        return uvec4(i, i, i, a);
+    }
+    if (tlutfmt == 1u) {
+        uint b0 = load_tlut_u8(arena_word, entry_offset);
+        uint b1 = load_tlut_u8(arena_word, entry_offset + 1u);
+        uint val = (b0 << 8) | b1;
+        return uvec4(expand5((val >> 11) & 0x1fu), expand6((val >> 5) & 0x3fu),
+                     expand5(val & 0x1fu), 255u);
+    }
+    if (tlutfmt == 2u) {
+        uint b0 = load_tlut_u8(arena_word, entry_offset);
+        uint b1 = load_tlut_u8(arena_word, entry_offset + 1u);
+        uint val = (b0 << 8) | b1;
+        if ((val & 0x8000u) != 0u)
+            return uvec4(expand5((val >> 10) & 0x1fu), expand5((val >> 5) & 0x1fu),
+                         expand5(val & 0x1fu), 255u);
+        return uvec4(expand4((val >> 8) & 0xfu), expand4((val >> 4) & 0xfu),
+                     expand4(val & 0xfu), expand3((val >> 12) & 0x7u));
+    }
+    return uvec4(0u);
+}
+
+// load_texture_u8 (gx_raster.c decode path), slot-generalized: fb is the
+// 12-word metadata base (79 for texmap==0's slot, 239 for texmap!=0's slot,
+// see shade_pixel_general), arena_word the per-slot texture-bytes base word
+// (99 / 255) and len_word the per-slot byte length (fb+11).
+uint load_texture_u8_g(uint arena_word, uint len_word, uint offset) {
+    if (offset >= jw(len_word)) return 0u;
+    uint packed = texture_data.words[(jw(arena_word) + offset) >> 2u];
+    return (packed >> ((offset & 3u) * 8u)) & 0xffu;
+}
+// be_u16 with decode_texel's joint OOB check (gx_raster.c's safe_u8-gated
+// `(offset+1 < src_len) ? be_u16(&src[offset]) : 0` shape -- the WHOLE
+// 16-bit read is zero if either byte would be out of bounds, not just the
+// individual out-of-bounds byte; phase 1b (RGB5A3/CMPR) needs this exact
+// joint semantics, not two independent load_texture_u8_g calls.
+uint load_texture_be16_g(uint arena_word, uint len_word, uint offset) {
+    if (offset + 1u >= jw(len_word)) return 0u;
+    uint b0 = load_texture_u8_g(arena_word, len_word, offset);
+    uint b1 = load_texture_u8_g(arena_word, len_word, offset + 1u);
+    return (b0 << 8) | b1;
+}
+
+// decode_texel (gx_raster.c:1197-1339), the 8 phase-1a eligible formats
+// (I4/I8/IA4/IA8/RGB5A3/RGBA8/C4/C8; CMPR/RGB565/C14X2 stay out of scope --
+// see docs/GX_GENERAL_TEV.md's eligibility gate). `fb+1u` (width) already
+// carries the same information decode_texel's `iw1` (width-1) does -- the
+// existing shader's I4/I8/RGBA8 cases below already establish the
+// width-based ceiling-division identity ((w+7)>>3 == ((w-1)>>3)+1), reused
+// here for the added formats too.
+uvec4 decode_texture_g(uint fb, uint arena_word, uint tlut_fmt_word, uint tlut_arena_word, int s, int t) {
+    uint ss = uint(s), tt = uint(t);
+    uint format = jw(fb);
+    uint len_word = fb + 11u;
+    uint w = jw(fb + 1u);
+    if (format == 0u) {                                  // I4 (decode_texel:1228-1237)
+        uint width_blocks = (w + 7u) >> 3;
+        uint base = ((tt >> 3) * width_blocks + (ss >> 3)) << 5;
+        uint blkOff = ((tt & 7u) << 3) + (ss & 7u);
+        uint raw = load_texture_u8_g(arena_word, len_word, base + (blkOff >> 1));
+        uint rs = (blkOff & 1u) != 0u ? 0u : 4u;
+        return uvec4(expand4((raw >> rs) & 0xfu));
+    }
+    if (format == 1u) {                                  // I8 (decode_texel:1238-1245)
+        uint width_blocks = (w + 7u) >> 3;
+        uint base = ((tt >> 2) * width_blocks + (ss >> 3)) << 5;
+        uint blkOff = ((tt & 3u) << 3) + (ss & 7u);
+        return uvec4(load_texture_u8_g(arena_word, len_word, base + blkOff));
+    }
+    if (format == 2u) {                                  // IA4 (decode_texel:1246-1254)
+        uint width_blocks = (w + 7u) >> 3;
+        uint base = ((tt >> 2) * width_blocks + (ss >> 3)) << 5;
+        uint blkOff = ((tt & 3u) << 3) + (ss & 7u);
+        uint raw = load_texture_u8_g(arena_word, len_word, base + blkOff);
+        uint a = expand4(raw >> 4);
+        uint l = expand4(raw & 0xfu);
+        return uvec4(l, l, l, a);
+    }
+    if (format == 3u) {                                  // IA8 (decode_texel:1255-1263)
+        uint width_blocks = (w + 3u) >> 2;
+        uint base = ((tt >> 2) * width_blocks + (ss >> 2)) << 4;
+        uint blkOff = ((tt & 3u) << 2) + (ss & 3u);
+        uint offset = (base + blkOff) << 1;
+        uint a = load_texture_u8_g(arena_word, len_word, offset);
+        uint i = load_texture_u8_g(arena_word, len_word, offset + 1u);
+        return uvec4(i, i, i, a);
+    }
+    if (format == 5u) {                                  // RGB5A3 (decode_texel:1276-1294)
+        uint width_blocks = (w + 3u) >> 2;
+        uint base = ((tt >> 2) * width_blocks + (ss >> 2)) << 4;
+        uint blkOff = ((tt & 3u) << 2) + (ss & 3u);
+        uint offset = (base + blkOff) << 1;
+        uint val = load_texture_be16_g(arena_word, len_word, offset);
+        if ((val & 0x8000u) != 0u)
+            return uvec4(expand5((val >> 10) & 0x1fu), expand5((val >> 5) & 0x1fu),
+                         expand5(val & 0x1fu), 255u);
+        return uvec4(expand4((val >> 8) & 0xfu), expand4((val >> 4) & 0xfu),
+                     expand4(val & 0xfu), expand3((val >> 12) & 0x7u));
+    }
+    if (format == 6u) {                                  // RGBA8 (decode_texel:1295-1305)
+        uint width_blocks = (w + 3u) >> 2;
+        /* <<6, NOT <<5: the C reference does base=(...)<<5 then a SEPARATE
+         * offset=(base+blkOff)<<1 step (2 bytes/texel); folding both steps
+         * into one shift (as the existing decode_texture()'s format==6 case
+         * above already does, and this generalized copy must match) needs
+         * <<6 total. Bug caught by pass C's per-triangle GPU differential
+         * (GCN_GX_VK_DRAW_VALIDATE=1 GCN_GX_VK_DRAW_PROGRAM=31): an earlier
+         * draft used <<5 here directly, which only happened to read the
+         * right bytes for the block containing (0,0) and silently corrupted
+         * every other block -- the brute-force harnesses never exercise
+         * texture decode, only the combiner/blend arithmetic, so this class
+         * of bug needed the real GPU-vs-software pixel compare to surface. */
+        uint base = ((tt >> 2) * width_blocks + (ss >> 2)) << 6;
+        uint index = ((tt & 3u) << 2) + (ss & 3u);
+        uint a = load_texture_u8_g(arena_word, len_word, base + index * 2u);
+        uint r = load_texture_u8_g(arena_word, len_word, base + index * 2u + 1u);
+        uint g = load_texture_u8_g(arena_word, len_word, base + 32u + index * 2u);
+        uint b = load_texture_u8_g(arena_word, len_word, base + 32u + index * 2u + 1u);
+        return uvec4(r, g, b, a);
+    }
+    if (format == 8u) {                                  // C4 (decode_texel:1202-1210)
+        uint width_blocks = (w + 7u) >> 3;
+        uint base = ((tt >> 3) * width_blocks + (ss >> 3)) << 5;
+        uint blkOff = ((tt & 7u) << 3) + (ss & 7u);
+        uint raw = load_texture_u8_g(arena_word, len_word, base + (blkOff >> 1));
+        uint rs = (blkOff & 1u) != 0u ? 0u : 4u;
+        uint idx = (raw >> rs) & 0xfu;
+        return decode_tlut_pixel_g(tlut_arena_word, idx * 2u, jw(tlut_fmt_word));
+    }
+    if (format == 9u) {                                  // C8 (decode_texel:1211-1218)
+        uint width_blocks = (w + 7u) >> 3;
+        uint base = ((tt >> 2) * width_blocks + (ss >> 3)) << 5;
+        uint blkOff = ((tt & 3u) << 3) + (ss & 7u);
+        uint idx = load_texture_u8_g(arena_word, len_word, base + blkOff);
+        return decode_tlut_pixel_g(tlut_arena_word, idx * 2u, jw(tlut_fmt_word));
+    }
+    if (format == 0xEu) {                                // CMPR (decode_texel:1337-1379), phase 1b
+        // 8x8 outer block, four 4x4 DXT1-style sub-blocks (2x2 arrangement).
+        uint sDxt = ss >> 2, tDxt = tt >> 2;
+        uint sBlk = sDxt >> 1, tBlk = tDxt >> 1;
+        uint width_blocks8 = (w + 7u) >> 3;   // ceil(width/8), outer 8x8 blocks
+        uint base = (tBlk * width_blocks8 + sBlk) << 2;
+        uint blkOff = ((tDxt & 1u) << 1) + (sDxt & 1u);
+        uint offset = (base + blkOff) << 3;   // 8 bytes/DXTBlock: c1(2) c2(2) lines(4)
+        uint c1 = load_texture_be16_g(arena_word, len_word, offset);
+        uint c2 = load_texture_be16_g(arena_word, len_word, offset + 2u);
+        uint line = load_texture_u8_g(arena_word, len_word, offset + 4u + (tt & 3u));
+        uint blue1 = expand5(c1 & 0x1fu), blue2 = expand5(c2 & 0x1fu);
+        uint green1 = expand6((c1 >> 5) & 0x3fu), green2 = expand6((c2 >> 5) & 0x3fu);
+        uint red1 = expand5((c1 >> 11) & 0x1fu), red2 = expand5((c2 >> 11) & 0x1fu);
+        int rs = 6 - int((ss & 3u) << 1);
+        uint colorSel = (line >> uint(rs)) & 3u;
+        colorSel |= (c1 > c2) ? 0u : 4u;
+        if (colorSel == 0u || colorSel == 4u)
+            return uvec4(red1, green1, blue1, 255u);
+        if (colorSel == 1u || colorSel == 5u)
+            return uvec4(red2, green2, blue2, 255u);
+        if (colorSel == 2u)
+            return uvec4((red2 * 3u + red1 * 5u) >> 3, (green2 * 3u + green1 * 5u) >> 3,
+                         (blue2 * 3u + blue1 * 5u) >> 3, 255u);
+        if (colorSel == 3u)
+            return uvec4((red1 * 3u + red2 * 5u) >> 3, (green1 * 3u + green2 * 5u) >> 3,
+                         (blue1 * 3u + blue2 * 5u) >> 3, 255u);
+        if (colorSel == 6u)
+            return uvec4((red1 + red2) >> 1, (green1 + green2) >> 1, (blue1 + blue2) >> 1, 255u);
+        if (colorSel == 7u)
+            return uvec4((red1 + red2) >> 1, (green1 + green2) >> 1, (blue1 + blue2) >> 1, 0u);
+        return uvec4(0u);
+    }
+    return uvec4(0u);
+}
+
+// texture_uv (gx_raster.c raster_pixel_prep's Uv[] derivation), texgen-slot
+// generalized: gen_base is 58 (texgen 0, tex[0]) or 218 (texgen 1, tex[1]),
+// each 3 slopes (s,t,q) 7 words apart; w (base 51) is per-vertex, shared by
+// every texgen.
+// precise throughout, matching texture_uv() above exactly: without it the
+// compiler is free to reassociate/fuse this chain differently than the
+// software reference's float math, which can flip the low bit of the
+// eventual 8-bit sample after the perspective divide + *128.0 fixed-point
+// conversion -- caught by pass C's per-triangle GPU differential as a
+// single-bit color mismatch (dithering, gated on bm_dither, turns any such
+// 1-ULP difference into a visible stored-pixel bit flip).
+precise vec2 texture_uv_g(uint gen_base, int x, int y) {
+    precise float inv_w = exact_rcp(slope_value(51u, x, y));
+    precise float q = slope_value(gen_base + 14u, x, y) * inv_w;
+    precise float projection = inv_w;
+    if (q != 0.0) projection = exact_div(inv_w, q);
+    precise float u = slope_value(gen_base, x, y) * projection;
+    precise float v = slope_value(gen_base + 7u, x, y) * projection;
+    return vec2(u, v);
+}
+
+// texture_linear (calc_lod / Rasterizer.cpp, same derivation as the existing
+// texture_linear() above), slot+texgen generalized.
+bool texture_linear_g(uint fb, uint gen_base, int bx, int by) {
+    precise vec2 uv00 = texture_uv_g(gen_base, bx, by);
+    precise vec2 uv10 = texture_uv_g(gen_base, bx + 1, by);
+    precise vec2 uv01 = texture_uv_g(gen_base, bx, by + 1);
+    precise float dudx = abs(uv00.x - uv10.x);
+    precise float dvdx = abs(uv00.y - uv10.y);
+    precise float dudy = abs(uv00.x - uv01.x);
+    precise float dvdy = abs(uv00.y - uv01.y);
+    precise float s_delta, t_delta;
+    if (jw(fb + 7u) != 0u) { s_delta = dudx + dudy; t_delta = dvdx + dvdy; }
+    else { s_delta = max(dudx, dudy); t_delta = max(dvdx, dvdy); }
+    int lod = fixed_log2(max(s_delta, t_delta));
+    lod += si(fb + 8u);
+    return (lod > 0 && jw(fb + 6u) == 1u) || (lod <= 0 && jw(fb + 5u) == 1u);
+}
+
+// sample_texture (existing, above), slot-generalized.
+uvec4 sample_texture_g(uint fb, uint arena_word, uint tlut_fmt_word, uint tlut_arena_word,
+                        int s, int t, bool linear) {
+    int width = int(jw(fb + 1u));
+    int height = int(jw(fb + 2u));
+    if (!linear) {
+        int is = wrap_coord(s >> 7, jw(fb + 3u), width);
+        int it = wrap_coord(t >> 7, jw(fb + 4u), height);
+        return decode_texture_g(fb, arena_word, tlut_fmt_word, tlut_arena_word, is, it);
+    }
+    s -= 64; t -= 64;
+    int is = s >> 7, it = t >> 7, is1 = is + 1, it1 = it + 1;
+    int fs = s & 0x7f, ft = t & 0x7f;
+    is = wrap_coord(is, jw(fb + 3u), width);
+    it = wrap_coord(it, jw(fb + 4u), height);
+    is1 = wrap_coord(is1, jw(fb + 3u), width);
+    it1 = wrap_coord(it1, jw(fb + 4u), height);
+    uvec4 v00 = decode_texture_g(fb, arena_word, tlut_fmt_word, tlut_arena_word, is, it);
+    uvec4 v10 = decode_texture_g(fb, arena_word, tlut_fmt_word, tlut_arena_word, is1, it);
+    uvec4 v01 = decode_texture_g(fb, arena_word, tlut_fmt_word, tlut_arena_word, is, it1);
+    uvec4 v11 = decode_texture_g(fb, arena_word, tlut_fmt_word, tlut_arena_word, is1, it1);
+    uvec4 acc = v00 * uint((128 - fs) * (128 - ft)) + v10 * uint(fs * (128 - ft)) +
+                v01 * uint((128 - fs) * ft) + v11 * uint(fs * ft);
+    return acc >> 14;
+}
+
+// src_factor/dst_factor (gx_raster.c:997-1026), re-expressed per RGBA lane
+// instead of C's packed-u32-byte-lane trick (both are the same value: each
+// lane's factor is either 0/255-uniform or the OTHER color's same-index
+// component, which is exactly what the C memcpy-and-shift produces per byte).
+uvec4 gen_src_factor(uvec4 srcv, uvec4 dstv, uint mode) {
+    if (mode == 0u) return uvec4(0u);
+    if (mode == 1u) return uvec4(0xffu);
+    if (mode == 2u) return dstv;                 // DstClr
+    if (mode == 3u) return uvec4(0xffu) - dstv;   // InvDstClr
+    uint a;
+    if (mode == 4u) a = srcv.x;                   // SrcAlpha
+    else if (mode == 5u) a = 0xffu - srcv.x;      // InvSrcAlpha
+    else if (mode == 6u) a = dstv.x;              // DstAlpha
+    else a = 0xffu - dstv.x;                      // InvDstAlpha
+    return uvec4(a);
+}
+uvec4 gen_dst_factor(uvec4 srcv, uvec4 dstv, uint mode) {
+    if (mode == 0u) return uvec4(0u);
+    if (mode == 1u) return uvec4(0xffu);
+    if (mode == 2u) return srcv;                  // SrcClr
+    if (mode == 3u) return uvec4(0xffu) - srcv;   // InvSrcClr
+    uint a;
+    if (mode == 4u) a = srcv.x;
+    else if (mode == 5u) a = 0xffu - srcv.x;
+    else if (mode == 6u) a = dstv.x;
+    else a = 0xffu - dstv.x;
+    return uvec4(a);
+}
+// BlendColor (gx_raster.c:1027-1037).
+uvec4 gen_blend_color(uvec4 srcv, uvec4 dstv, uint srcMode, uint dstMode) {
+    uvec4 sf = gen_src_factor(srcv, dstv, srcMode);
+    uvec4 df = gen_dst_factor(srcv, dstv, dstMode);
+    uvec4 scc = sf + (sf >> 7);
+    uvec4 dcc = df + (df >> 7);
+    uvec4 result = (srcv * scc + dstv * dcc) >> 8;
+    return min(result, uvec4(255u));
+}
+// SubtractBlend (gx_raster.c:1038-1043).
+uvec4 gen_subtract_blend(uvec4 srcv, uvec4 dstv) {
+    ivec4 diff = ivec4(dstv) - ivec4(srcv);
+    return uvec4(max(diff, ivec4(0)));
+}
+// LogicBlend (gx_raster.c:1044-1063), on the packed 32-bit value exactly as
+// the C source does (bitwise ops are byte-boundary-independent, but ~ on a
+// masked per-lane value would corrupt neighbor bits if done per-lane without
+// the full-word pack/unpack -- this mirrors memcpy(&s,color,4) precisely).
+uint pack_abgr(uvec4 v) {
+    return (v.x & 0xffu) | ((v.y & 0xffu) << 8) | ((v.z & 0xffu) << 16) | ((v.w & 0xffu) << 24);
+}
+uvec4 unpack_abgr(uint p) {
+    return uvec4(p & 0xffu, (p >> 8) & 0xffu, (p >> 16) & 0xffu, (p >> 24) & 0xffu);
+}
+uint gen_logic_blend_u32(uint s, uint d, uint op) {
+    if (op == 0u)  return 0u;
+    if (op == 1u)  return s & d;
+    if (op == 2u)  return s & (~d);
+    if (op == 3u)  return s;
+    if (op == 4u)  return (~s) & d;
+    if (op == 5u)  return d;
+    if (op == 6u)  return s ^ d;
+    if (op == 7u)  return s | d;
+    if (op == 8u)  return ~(s | d);
+    if (op == 9u)  return ~(s ^ d);
+    if (op == 10u) return ~d;
+    if (op == 11u) return s | (~d);
+    if (op == 12u) return ~s;
+    if (op == 13u) return (~s) | d;
+    if (op == 14u) return ~(s & d);
+    return 0xffffffffu;
+}
+
+// tev_draw + blend_stage + BlendTev orchestration (gx_raster.c:2204-2316,
+// 1965-1993, 1070-1095), driven entirely off the words-112..255 general
+// block. DEAD CODE (see file-header comment above): unreachable until
+// compute_program_id classifies a draw to program id 31 (pass C).
+void shade_pixel_general(int x, int y) {
+    // Pass D debug hook (docs/GX_GENERAL_TEV.md): armed only when this pixel
+    // matches the push-constant (x,y); one bool compare when unarmed.
+    bool dbg = (x == draw_push.dbg_x && y == draw_push.dbg_y);
+    if (x >= si(3u) || y >= si(5u)) return;
+    int x16 = x << 4;
+    int y16 = y << 4;
+    if (si(6u) + si(9u) * y16 - si(12u) * x16 <= 0 ||
+        si(7u) + si(10u) * y16 - si(13u) * x16 <= 0 ||
+        si(8u) + si(11u) * y16 - si(14u) * x16 <= 0)
+        return;
+
+    uint genmode = jw(112u);
+    uint numtexgens = ubits(genmode, 0u, 4u);
+    uint numstages = ubits(genmode, 10u, 4u);   // actual stage count is +1
+
+    // ZMode (word 186, raw BP 0x40) / PEControl (word 189, raw BP 0x43 bit6).
+    uint zmode = jw(186u);
+    bool zt_enable = ubits(zmode, 0u, 1u) != 0u;
+    uint zt_func = ubits(zmode, 1u, 3u);
+    bool zt_update = ubits(zmode, 4u, 1u) != 0u;
+    bool zt_early = ubits(jw(189u), 6u, 1u) != 0u;
+
+    // Gate excludes z-texture (BP 0xF4/0xF5 disabled), so ztexture_depth's
+    // op==0 passthrough is the ONLY case reachable -- z fed to ZCompare is
+    // always the plain interpolated depth (gx_raster.c:1857-1864,1973-1974).
+    int zraw = int(slope_value(100u, x, y));
+    zraw = clamp(zraw, 0, 16777215);
+    uint zval = uint(zraw);
+    bool zt_pass = true;
+    if (zt_enable) {
+        uint old_depth = imageLoad(efb_depth, ivec2(x, y)).r & 0x00ffffffu;
+        if (zt_func == 0u) zt_pass = false;
+        else if (zt_func == 1u) zt_pass = zval < old_depth;
+        else if (zt_func == 2u) zt_pass = zval == old_depth;
+        else if (zt_func == 3u) zt_pass = zval <= old_depth;
+        else if (zt_func == 4u) zt_pass = zval > old_depth;
+        else if (zt_func == 5u) zt_pass = zval != old_depth;
+        else if (zt_func == 6u) zt_pass = zval >= old_depth;
+        else zt_pass = true;
+        if (zt_early) {
+            if (!zt_pass) return;
+            if (zt_update) imageStore(efb_depth, ivec2(x, y), uvec4(zval));
+        }
+    }
+
+    GenColor konst[4];
+    gen_load_konst(konst);
+    GenColor reg[4];
+    for (int i = 0; i < 4; ++i) {
+        reg[i].r = int(jw(161u + uint(i) * 4u + 0u));
+        reg[i].g = int(jw(161u + uint(i) * 4u + 1u));
+        reg[i].b = int(jw(161u + uint(i) * 4u + 2u));
+        reg[i].a = int(jw(161u + uint(i) * 4u + 3u));
+    }
+
+    GenColor tex_color = GenColor(0, 0, 0, 0);
+    uint lastC22 = 0u, lastA22 = 0u;
+    // Slot assignment mirrors gx_vulkan.c's resolve_fused_texture EXACTLY:
+    // first-enabled-stage-order (slot 0 = the first distinct texmap an
+    // enabled stage references, slot 1 = the next distinct one), NOT
+    // "texmap==0" -- a draw is not guaranteed to sample texmap 0 at all,
+    // let alone at the first enabled stage. Mismatching this against the
+    // CPU/packer's assignment reads the WRONG unit's width/wrap/format
+    // metadata (caught by the differential: a CMPR unit's fetch clamped to
+    // a co-resident unit's smaller width because the shader assumed
+    // texmap==0 was always slot 0).
+    bool slot0_valid = false;
+    uint slot0_texmap = 0u;
+
+    for (uint stage = 0u; stage <= numstages; ++stage) {
+        uint s2 = stage >> 1u;
+        uint odd = stage & 1u;
+        uint order = jw(145u + s2);          // TRef (BP 0x28-0x2F)
+        uint texcoordSel = (odd != 0u) ? ubits(order, 15u, 3u) : ubits(order, 3u, 3u);
+        uint texmap      = (odd != 0u) ? ubits(order, 12u, 3u) : ubits(order, 0u, 3u);
+        uint enable      = (odd != 0u) ? ubits(order, 18u, 1u) : ubits(order, 6u, 1u);
+        uint colorchan   = (odd != 0u) ? ubits(order, 19u, 3u) : ubits(order, 7u, 3u);
+        if (texcoordSel >= numtexgens) texcoordSel = 0u;
+
+        uint cc = jw(113u + stage * 2u);      // TevStageCombiner (BP 0xC0-0xDF)
+        uint ac = jw(113u + stage * 2u + 1u);
+        uint argA = ubits(cc, 12u, 4u), argB = ubits(cc, 8u, 4u);
+        uint argC = ubits(cc, 4u, 4u),  argD = ubits(cc, 0u, 4u);
+        uint aargA = ubits(ac, 13u, 3u), aargB = ubits(ac, 10u, 3u);
+        uint aargC = ubits(ac, 7u, 3u),  aargD = ubits(ac, 4u, 3u);
+        uint c16 = ubits(cc, 16u, 2u), c18 = ubits(cc, 18u, 1u);
+        uint c19 = ubits(cc, 19u, 1u), c20 = ubits(cc, 20u, 2u), c22 = ubits(cc, 22u, 2u);
+        uint a16 = ubits(ac, 16u, 2u), a18 = ubits(ac, 18u, 1u);
+        uint a19 = ubits(ac, 19u, 1u), a20 = ubits(ac, 20u, 2u), a22 = ubits(ac, 22u, 2u);
+        uint tswap_id = ubits(ac, 2u, 2u), rswap_id = ubits(ac, 0u, 2u);
+        lastC22 = c22; lastA22 = a22;
+
+        // tev_indirect_coord's identity path (gx_raster.c:2054-2057) -- every
+        // eligible stage's tevind is 0 (indirect excluded by the gate), so
+        // TexCoordS/T are always the plain UvS/UvT[texcoordSel] fixed-point
+        // values, reproduced directly via texture_uv_g rather than modeling
+        // UvS/UvT as an intermediate.
+
+        // konst for this stage (kcsel/kasel, BP 0xF6-0xFD words 153-160).
+        uint ksel = jw(153u + s2);
+        uint kc = (odd != 0u) ? ubits(ksel, 14u, 5u) : ubits(ksel, 4u, 5u);
+        uint ka = (odd != 0u) ? ubits(ksel, 19u, 5u) : ubits(ksel, 9u, 5u);
+        GenColor stage_konst = gen_konst_lookup(konst, kc);
+        stage_konst.a = gen_konst_lookup(konst, ka).a;
+
+        // texel + swap (tev_draw:2222-2237). TexColor persists across stages
+        // where enable==0 (matches Tev's persistent-struct-field semantics).
+        if (enable != 0u) {
+            uint tex_chan[4];
+            if (numtexgens > 0u) {
+                uint gen_base = (texcoordSel == 0u) ? 58u : 218u;
+                // First-enabled-stage-order slot assignment (see the
+                // slot0_valid/slot0_texmap comment above) -- NOT texmap==0.
+                bool is_slot0;
+                if (!slot0_valid) { slot0_valid = true; slot0_texmap = texmap; is_slot0 = true; }
+                else is_slot0 = (texmap == slot0_texmap);
+                uint fb = is_slot0 ? 79u : 239u;
+                uint arena = is_slot0 ? 99u : 255u;
+                uint tlut_fmt_w = is_slot0 ? 251u : 253u;
+                uint tlut_arena_w = is_slot0 ? 252u : 254u;
+                int bx = x & ~1, by = y & ~1;
+                precise vec2 uv = texture_uv_g(gen_base, x, y);
+                precise float sfixed = uv.x * 128.0;
+                precise float tfixed = uv.y * 128.0;
+                bool linear = texture_linear_g(fb, gen_base, bx, by);
+                uvec4 texel = sample_texture_g(fb, arena, tlut_fmt_w, tlut_arena_w,
+                                               int(sfixed), int(tfixed), linear);
+                tex_chan[0] = texel.r; tex_chan[1] = texel.g;
+                tex_chan[2] = texel.b; tex_chan[3] = texel.a;
+                if (dbg) {
+                    // Recompute the perspective-divide + bilinear intermediates
+                    // for the dump only (sample_texture_g doesn't expose them);
+                    // same expressions, no behavior change to the real path.
+                    precise float wraw = slope_value(51u, x, y);
+                    precise float inv_w = exact_rcp(wraw);
+                    precise float q = slope_value(gen_base + 14u, x, y) * inv_w;
+                    gen_debug.words[0] = 0xDEADBEEFu;
+                    gen_debug.words[1] = jw(50u);
+                    gen_debug.words[2] = uint(x); gen_debug.words[3] = uint(y);
+                    gen_debug.words[4] = floatBitsToUint(uv.x);
+                    gen_debug.words[5] = floatBitsToUint(uv.y);
+                    gen_debug.words[6] = floatBitsToUint(inv_w);
+                    gen_debug.words[7] = floatBitsToUint(q);
+                    gen_debug.words[36] = floatBitsToUint(wraw);
+                    gen_debug.words[8] = floatBitsToUint(sfixed);
+                    gen_debug.words[9] = floatBitsToUint(tfixed);
+                    gen_debug.words[10] = uint(int(sfixed));
+                    gen_debug.words[11] = uint(int(tfixed));
+                    gen_debug.words[12] = linear ? 1u : 0u;
+                    int width = int(jw(fb + 1u));
+                    int height = int(jw(fb + 2u));
+                    int ds = int(sfixed), dt = int(tfixed);
+                    if (linear) {
+                        ds -= 64; dt -= 64;
+                        int is0 = ds >> 7, it0 = dt >> 7, is1 = is0 + 1, it1 = it0 + 1;
+                        int fs = ds & 0x7f, ft = dt & 0x7f;
+                        is0 = wrap_coord(is0, jw(fb + 3u), width);
+                        it0 = wrap_coord(it0, jw(fb + 4u), height);
+                        is1 = wrap_coord(is1, jw(fb + 3u), width);
+                        it1 = wrap_coord(it1, jw(fb + 4u), height);
+                        gen_debug.words[13] = uint(is0); gen_debug.words[14] = uint(it0);
+                        gen_debug.words[15] = uint(is1); gen_debug.words[16] = uint(it1);
+                        gen_debug.words[17] = uint(fs); gen_debug.words[18] = uint(ft);
+                        uvec4 v00 = decode_texture_g(fb, arena, tlut_fmt_w, tlut_arena_w, is0, it0);
+                        uvec4 v10 = decode_texture_g(fb, arena, tlut_fmt_w, tlut_arena_w, is1, it0);
+                        uvec4 v01 = decode_texture_g(fb, arena, tlut_fmt_w, tlut_arena_w, is0, it1);
+                        uvec4 v11 = decode_texture_g(fb, arena, tlut_fmt_w, tlut_arena_w, is1, it1);
+                        // pack_abgr's x|y<<8|z<<16|w<<24 applied to an (r,g,b,a)
+                        // vector packs as r|g<<8|b<<16|a<<24 -- the CPU printer
+                        // unpacks with that same (R,G,B,A) convention.
+                        gen_debug.words[19] = pack_abgr(v00);
+                        gen_debug.words[20] = pack_abgr(v10);
+                        gen_debug.words[21] = pack_abgr(v01);
+                        gen_debug.words[22] = pack_abgr(v11);
+                    } else {
+                        int is0 = wrap_coord(ds >> 7, jw(fb + 3u), width);
+                        int it0 = wrap_coord(dt >> 7, jw(fb + 4u), height);
+                        gen_debug.words[13] = uint(is0); gen_debug.words[14] = uint(it0);
+                    }
+                    gen_debug.words[23] = pack_abgr(texel);   // (r,g,b,a) packing
+                }
+            } else {
+                tex_chan[0] = 0u; tex_chan[1] = 0u; tex_chan[2] = 0u; tex_chan[3] = 0u;
+            }
+            uint sw[4];
+            gen_swap_table(tswap_id, sw);
+            tex_color.r = int(tex_chan[sw[0]]);
+            tex_color.g = int(tex_chan[sw[1]]);
+            tex_color.b = int(tex_chan[sw[2]]);
+            tex_color.a = int(tex_chan[sw[3]]);
+            if (dbg) gen_debug.words[24] = pack_abgr(uvec4(uint(tex_color.r) & 0xffu,
+                uint(tex_color.g) & 0xffu, uint(tex_color.b) & 0xffu, uint(tex_color.a) & 0xffu));
+        }
+
+        // ras color (SetRasColor, tev_draw:2245-2261). colorchan 5/6 (bump
+        // alpha) is excluded by the eligibility gate.
+        GenColor ras_color;
+        {
+            uint rsw[4];
+            gen_swap_table(rswap_id, rsw);
+            if (colorchan == 0u || colorchan == 1u) {
+                uint colv[4];
+                uint cb = (colorchan == 0u) ? 22u : 190u;
+                colv[0] = color_byte(cb, x, y);
+                colv[1] = color_byte(cb + 7u, x, y);
+                colv[2] = color_byte(cb + 14u, x, y);
+                colv[3] = color_byte(cb + 21u, x, y);
+                ras_color.r = int(colv[rsw[0]]); ras_color.g = int(colv[rsw[1]]);
+                ras_color.b = int(colv[rsw[2]]); ras_color.a = int(colv[rsw[3]]);
+            } else {
+                ras_color = GenColor(0, 0, 0, 0);
+            }
+            if (dbg) gen_debug.words[25] = pack_abgr(uvec4(uint(ras_color.r) & 0xffu,
+                uint(ras_color.g) & 0xffu, uint(ras_color.b) & 0xffu, uint(ras_color.a) & 0xffu));
+        }
+
+        int inA[4], inB[4], inC[4], inD[4];
+        int r, g, b;
+        gen_color_arg(reg, tex_color, ras_color, stage_konst, argA, r, g, b); inA[3] = r; inA[2] = g; inA[1] = b;
+        gen_color_arg(reg, tex_color, ras_color, stage_konst, argB, r, g, b); inB[3] = r; inB[2] = g; inB[1] = b;
+        gen_color_arg(reg, tex_color, ras_color, stage_konst, argC, r, g, b); inC[3] = r; inC[2] = g; inC[1] = b;
+        gen_color_arg(reg, tex_color, ras_color, stage_konst, argD, r, g, b); inD[3] = r; inD[2] = g; inD[1] = b;
+        inA[0] = gen_alpha_arg(reg, tex_color, ras_color, stage_konst, aargA);
+        inB[0] = gen_alpha_arg(reg, tex_color, ras_color, stage_konst, aargB);
+        inC[0] = gen_alpha_arg(reg, tex_color, ras_color, stage_konst, aargC);
+        inD[0] = gen_alpha_arg(reg, tex_color, ras_color, stage_konst, aargD);
+
+        if (c16 != 3u) gen_draw_color_regular(reg, c16, c18, c19, c20, c22, inA, inB, inC, inD);
+        else           gen_draw_color_compare(reg, c20, c18, c19, c22, inA, inB, inC, inD);
+        if (a16 != 3u) gen_draw_alpha_regular(reg, a16, a18, a19, a20, a22, inA[0], inB[0], inC[0], inD[0]);
+        else           gen_draw_alpha_compare(reg, a20, a18, a19, a22, inA, inB, inC[0], inD[0]);
+    }
+
+    int out_r = int(uint(reg[lastC22].r) & 0xffu);
+    int out_g = int(uint(reg[lastC22].g) & 0xffu);
+    int out_b = int(uint(reg[lastC22].b) & 0xffu);
+    int out_a = int(uint(reg[lastA22].a) & 0xffu);
+    if (dbg) gen_debug.words[28] = pack_abgr(uvec4(uint(out_r), uint(out_g), uint(out_b), uint(out_a)));
+
+    if (!gen_alpha_test(out_a)) return;
+
+    // apply_fog runs between alpha-test and blend (tev_comb_finish,
+    // gx_raster.c:2164-2179), strictly before blend_stage's late-Z --
+    // matched here exactly (fog, THEN the late-Z branch below).
+    gen_apply_fog(out_r, out_g, out_b, x, y, zval);
+
+    if (zt_enable && !zt_early) {
+        if (!zt_pass) return;
+        if (zt_update) imageStore(efb_depth, ivec2(x, y), uvec4(zval));
+    }
+
+    uvec4 srcv = uvec4(uint(out_a), uint(out_b), uint(out_g), uint(out_r));
+    uint pf = jw(21u);
+    uint old = imageLoad(efb_color, ivec2(x, y)).r;
+    uvec4 dstv = get_abgr(old, pf);
+    if (dbg) { gen_debug.words[29] = pf; gen_debug.words[30] = old; gen_debug.words[32] = pack_abgr(dstv); }
+
+    uint bm = jw(187u);
+    bool blend_enable = ubits(bm, 0u, 1u) != 0u;
+    bool logic_enable = ubits(bm, 1u, 1u) != 0u;
+    bool dither_on = ubits(bm, 2u, 1u) != 0u;
+    bool color_update = ubits(bm, 3u, 1u) != 0u;
+    bool alpha_update = ubits(bm, 4u, 1u) != 0u;
+    uint dst_factor_mode = ubits(bm, 5u, 3u);
+    uint src_factor_mode = ubits(bm, 8u, 3u);
+    bool subtract = ubits(bm, 11u, 1u) != 0u;
+    uint logic_mode = ubits(bm, 12u, 4u);
+
+    uvec4 result;
+    if (blend_enable) {
+        result = subtract ? gen_subtract_blend(srcv, dstv)
+                           : gen_blend_color(srcv, dstv, src_factor_mode, dst_factor_mode);
+    } else if (logic_enable) {
+        result = unpack_abgr(gen_logic_blend_u32(pack_abgr(srcv), pack_abgr(dstv), logic_mode));
+    } else {
+        result = srcv;
+    }
+
+    uint destalpha_word = jw(188u);
+    if (ubits(destalpha_word, 8u, 1u) != 0u) result.x = ubits(destalpha_word, 0u, 8u);
+    if (dbg) gen_debug.words[33] = pack_abgr(result);   // pre-dither blended value
+
+    if (color_update) {
+        if (dither_on && pf == 1u) {
+            const uint matrix[4] = uint[4](0u, 2u, 3u, 1u);
+            uint dth = matrix[((uint(y) & 1u) << 1) | (uint(x) & 1u)];
+            result.y = ((result.y - (result.y >> 6)) + dth) & 0xfcu;
+            result.z = ((result.z - (result.z >> 6)) + dth) & 0xfcu;
+            result.w = ((result.w - (result.w >> 6)) + dth) & 0xfcu;
+        }
+        if (dbg) gen_debug.words[34] = pack_abgr(result);   // post-dither
+        if (pf == 1u) {
+            uint alpha6 = alpha_update ? ((result.x >> 2) & 0x3fu) : (old & 0x3fu);
+            uint value = (old & 0xff000000u) | alpha6 |
+                    ((result.y << 4) & 0x00000fc0u) |
+                    ((result.z << 10) & 0x0003f000u) |
+                    ((result.w << 16) & 0x00fc0000u);
+            imageStore(efb_color, ivec2(x, y), uvec4(value));
+            if (dbg) gen_debug.words[35] = value;
+        } else {
+            uint value = (old & 0xff000000u) | result.y | (result.z << 8) | (result.w << 16);
+            imageStore(efb_color, ivec2(x, y), uvec4(value));
+            if (dbg) gen_debug.words[35] = value;
+        }
+    } else if (alpha_update) {
+        // SetPixelAlphaOnly (gx_raster.c:883-888): pf!=1 has no alpha plane,
+        // a deliberate no-op, not an omission.
+        if (pf == 1u) {
+            uint value = (old & 0xffffffc0u) | ((result.x >> 2) & 0x3fu);
+            imageStore(efb_color, ivec2(x, y), uvec4(value));
+        }
+    }
+}
+
+void shade_pixel(int x, int y) {
+    // Phase 1a general TEV program (id 31, docs/GX_GENERAL_TEV.md). DEAD
+    // CODE: compute_program_id never returns 31 yet (pass C authorizes the
+    // classifier flip); this check costs one extra jw() read + branch per
+    // pixel for every existing program until then.
+    if (jw(50u) == 31u) { shade_pixel_general(x, y); return; }
+
+    if (x >= si(3u) || y >= si(5u))
+        return;
+
+    int x16 = x << 4;
+    int y16 = y << 4;
+    if (si(6u) + si(9u) * y16 - si(12u) * x16 <= 0 ||
+        si(7u) + si(10u) * y16 - si(13u) * x16 <= 0 ||
+        si(8u) + si(11u) * y16 - si(14u) * x16 <= 0)
+        return;
+
+    uint program = jw(50u);
+    if (program == 11u || program == 12u || program == 24u) {
+        int z = int(slope_value(100u, x, y));
+        z = clamp(z, 0, 16777215);
+        uint old_depth = imageLoad(efb_depth, ivec2(x, y)).r & 0x00ffffffu;
+        if (uint(z) > old_depth)
+            return;
+        imageStore(efb_depth, ivec2(x, y), uvec4(uint(z)));
+    } else if (program == 28u || program == 29u || program == 30u) {
+        // AB/AC/AD: zt_enable==1/zt_early==1/CMP_LEQUAL like K/L/X, but
+        // zupd==0 (see gpu_program_AB_match's derivation) -- test only,
+        // never write the depth plane.
+        int z = int(slope_value(100u, x, y));
+        z = clamp(z, 0, 16777215);
+        uint old_depth = imageLoad(efb_depth, ivec2(x, y)).r & 0x00ffffffu;
+        if (uint(z) > old_depth)
+            return;
+    }
+    uint ras_r = color_byte(22u, x, y);
+    uint ras_g = color_byte(29u, x, y);
+    uint ras_b = color_byte(36u, x, y);
+    uint ras_a = color_byte(43u, x, y);
+    uint out_r = ras_r, out_g = ras_g, out_b = ras_b, out_a = ras_a;
+
+    if (program != 6u && program != 10u && program != 13u &&
+        program != 16u && program != 20u && program != 23u &&
+        program != 25u && program != 26u && program != 27u &&
+        program != 28u && program != 29u && program != 30u) {
+        int bx = x & ~1;
+        int by = y & ~1;
+        precise vec2 uv = texture_uv(x, y);
+        precise float sfixed = uv.x * 128.0;
+        precise float tfixed = uv.y * 128.0;
+        uvec4 texel = sample_texture(int(sfixed), int(tfixed),
+                                    texture_linear(bx, by));
+        if (program == 1u || program == 8u || program == 17u) {
+            out_r = texel.r; out_g = texel.g; out_b = texel.b;
+            out_a = modulate(ras_a, texel.a);
+            if (program == 8u) {
+                int p = int(out_a);
+                int cc = p + (p >> 7);
+                out_a = clamp255_s16((si(98u) * cc + 128) >> 8);
+            }
+        } else if (program == 2u || program == 3u) {
+            out_r = core_c_channel(texel.r, si(91u));
+            out_g = core_c_channel(texel.g, si(92u));
+            out_b = core_c_channel(texel.b, si(93u));
+            out_a = modulate(ras_a, texel.a);
+            if (program == 2u) {
+                int p = int(out_a);
+                int cc = p + (p >> 7);
+                out_a = clamp255_s16((si(98u) * cc + 128) >> 8);
+            }
+        } else if (program == 4u) {
+            out_a = modulate(texel.a, ras_a);
+        } else if (program == 5u || program == 7u || program == 12u) {
+            out_r = program_e_channel(texel.r, si(91u), si(94u));
+            out_g = program_e_channel(texel.g, si(92u), si(95u));
+            out_b = program_e_channel(texel.b, si(93u), si(96u));
+            uint cc = uint(si(97u)) + (uint(si(97u)) >> 7);
+            int alpha = int(uint(ras_a) * cc + 128u) >> 8;
+            out_a = clamp255_s16(alpha);
+            if (program == 7u) {
+                int p = int(out_a);
+                int stage1_cc = p + (p >> 7);
+                out_a = clamp255_s16((si(98u) * stage1_cc + 128) >> 8);
+            }
+        } else if (program == 9u || program == 11u) {
+            out_r = texel.r; out_g = texel.g; out_b = texel.b;
+            uint cc0 = uint(si(97u)) + (uint(si(97u)) >> 7);
+            int p = clamp1024_s16((int(ras_a) * int(cc0) + 128) >> 8);
+            if (program == 11u) {
+                out_a = uint(p) & 0xffu;
+            } else {
+                uint cc1 = uint(p) + (uint(p) >> 7);
+                out_a = clamp255_s16((si(98u) * int(cc1) + 128) >> 8);
+            }
+        } else if (program == 14u) {
+            out_r = core_c_channel(texel.r, si(91u));
+            out_g = core_c_channel(texel.g, si(92u));
+            out_b = core_c_channel(texel.b, si(93u));
+            uint p = modulate2(ras_a, texel.a);
+            out_a = modulate(uint(si(98u)), p);
+        } else if (program == 15u || program == 18u) {
+            out_r = clamp255_s16(si(91u) + int(modulate(ras_r, texel.r)));
+            out_g = clamp255_s16(si(92u) + int(modulate(ras_g, texel.g)));
+            out_b = clamp255_s16(si(93u) + int(modulate(ras_b, texel.b)));
+            int cc = int(texel.a + (texel.a >> 7));
+            int p = (int(ras_a) * cc) >> 8;
+            uint stage0_a = clamp255_s16((si(107u) + p) >> 1);
+            out_a = program == 15u ? modulate(uint(si(98u)), stage0_a) :
+                                     stage0_a;
+        } else if (program == 19u) {
+            out_r = clamp255_s16(si(91u) * 2 + int(texel.r + (texel.r >> 7)));
+            out_g = clamp255_s16(si(92u) * 2 + int(texel.g + (texel.g >> 7)));
+            out_b = clamp255_s16(si(93u) * 2 + int(texel.b + (texel.b >> 7)));
+            uint p = modulate(ras_a, uint(si(97u)));
+            out_a = modulate(uint(si(98u)), p);
+        } else if (program == 21u || program == 22u) {
+            // U/V: program-C color, alpha = Reg1.a modulated by texel.a's cc
+            // (signed Reg1.a -> explicit int math, never modulate()'s uint).
+            out_r = core_c_channel(texel.r, si(91u));
+            out_g = core_c_channel(texel.g, si(92u));
+            out_b = core_c_channel(texel.b, si(93u));
+            int cc = int(texel.a + (texel.a >> 7));
+            out_a = clamp255_s16((si(107u) * cc + 128) >> 8);
+            if (program == 22u) {
+                int p = int(out_a);
+                int cc1 = p + (p >> 7);
+                out_a = clamp255_s16((si(98u) * cc1 + 128) >> 8);
+            }
+        } else if (program == 24u) {
+            // X: program-S stage 0 alone, under the K/L depth block above.
+            out_r = clamp255_s16(si(91u) * 2 + int(texel.r + (texel.r >> 7)));
+            out_g = clamp255_s16(si(92u) * 2 + int(texel.g + (texel.g >> 7)));
+            out_b = clamp255_s16(si(93u) * 2 + int(texel.b + (texel.b >> 7)));
+            out_a = modulate(ras_a, uint(si(97u)));
+        }
+    }
+    if (program == 10u) {
+        int p = int(ras_a);
+        int cc = p + (p >> 7);
+        out_a = clamp255_s16((si(98u) * cc + 128) >> 8);
+    }
+    if (program == 20u || program == 23u) {
+        // T/W: color is the RasColor identity (out_* already ras); alpha =
+        // Konst0.a (signed) modulated by ras_a's cc.
+        int cc = int(ras_a) + int(ras_a >> 7);
+        out_a = clamp255_s16((si(97u) * cc + 128) >> 8);
+    }
+    // Y/Z (25/26): color AND alpha are both the RasColor identity -- out_*
+    // already equal ras_r/g/b/a from the defaults above, no override needed.
+    if (program == 27u || program == 28u) {
+        // AA/AB: ac's every alpha arg is ZERO -> alpha is always 0.
+        out_a = 0u;
+    }
+    if (program == 28u || program == 29u) {
+        // AB/AC: color is StageKonst.rgb (clamp255 passthrough identity).
+        out_r = clamp255_s16(si(108u));
+        out_g = clamp255_s16(si(109u));
+        out_b = clamp255_s16(si(110u));
+    }
+    // AC (29): alpha is the RasColor.a identity -- out_a already equals
+    // ras_a from the defaults above, no override needed.
+    if (program == 30u) {
+        // AD: color is Reg[1].rgb (clamp255 passthrough identity, signed);
+        // alpha = StageKonst.a (signed) modulated by ras_a's cc -- same
+        // shape as T/W's alpha fold above, different operand slot.
+        out_r = clamp255_s16(si(91u));
+        out_g = clamp255_s16(si(92u));
+        out_b = clamp255_s16(si(93u));
+        int cc = int(ras_a) + int(ras_a >> 7);
+        out_a = clamp255_s16((si(97u) * cc + 128) >> 8);
+    }
+
+    uvec4 src = uvec4(out_a, out_b, out_g, out_r);
+    uint pf = jw(21u);
+    uint old = imageLoad(efb_color, ivec2(x, y)).r;
+    uvec4 dst = get_abgr(old, pf);
+
+    uvec4 blended;
+    if (program == 27u) {
+        // AA: sf=DstAlpha (dst's own current alpha before this blend) /
+        // df=One (0xff+(0xff>>7)==256, a compile-time constant). da_enable
+        // then unconditionally overwrites the alpha channel with da_alpha
+        // (0) regardless of what BlendColor computed there -- see
+        // gpu_program_AA_match's derivation -- so the fold never computes a
+        // blended alpha at all, it just stores 0 directly.
+        uint dst_alpha = dst.x;
+        uint sa2 = dst_alpha + (dst_alpha >> 7);
+        blended = min((src * sa2 + dst * 256u) >> 8, uvec4(255u));
+        blended.x = 0u;
+    } else if (program == 16u || program == 17u || program == 26u ||
+               program == 28u) {
+        // P/Q/Z/AB: blend_enable==0 && logic_enable==0 -> BlendTev's
+        // passthrough branch, dst := src unchanged. AB (gpu_program_AB_match:
+        // bm_blend_enable==0, same opaque shape as P/Q/Z) was missing from
+        // this list -- it fell into the general alpha-blend branch below,
+        // whose src_alpha comes from src.x (out_a). AB's ac word (0x08FFF0)
+        // makes ALPHA unconditionally 0 (see gpu_program_AB_match's
+        // derivation), so that branch's sa=0/da=256 makes
+        // blended=min(dst*256>>8,255)==dst: the draw silently no-op'd,
+        // leaving the destination (usually still the frame's clear value)
+        // instead of writing AB's real StageKonst.rgb color -- exactly the
+        // corun "gpu=00000000 sw=<real color>" divergence this fixes. AC/AD
+        // (29/30) are unaffected: both have bm_blend_enable==1 with a real,
+        // non-zero alpha feeding the same general branch on purpose.
+        blended = src;
+    } else {
+        uint src_alpha = src.x;
+        uint sa = src_alpha + (src_alpha >> 7);
+        uint inverse = 255u - src_alpha;
+        uint da = inverse + (inverse >> 7);
+        blended = min((src * sa + dst * da) >> 8, uvec4(255u));
+    }
+
+    // alpha_update (s_bm_au): every program pins au==1 except AB/AC/AD
+    // (au==0 fixed by their matchers) and Y/Z (au read live -- see
+    // GxRasterTriangleJob::bm_au's comment). au only matters for the
+    // RGBA6_Z24 packed format below; the "direct" formats never carry a
+    // real alpha plane at all (matches SetPixelColorOnly/SetPixelAlphaColor
+    // being identical for those formats on the CPU side).
+    bool write_alpha = true;
+    if (program == 28u || program == 29u || program == 30u)
+        write_alpha = false;
+    else if (program == 25u || program == 26u)
+        write_alpha = jw(111u) != 0u;
+
+    if (pf == 1u) {
+        const uint matrix[4] = uint[4](0u, 2u, 3u, 1u);
+        uint dither = matrix[((uint(y) & 1u) << 1) | (uint(x) & 1u)];
+        blended.y = ((blended.y - (blended.y >> 6)) + dither) & 0xfcu;
+        blended.z = ((blended.z - (blended.z >> 6)) + dither) & 0xfcu;
+        blended.w = ((blended.w - (blended.w >> 6)) + dither) & 0xfcu;
+        uint alpha6 = write_alpha ? ((blended.x >> 2) & 0x3fu) : (old & 0x3fu);
+        uint value = (old & 0xff000000u) |
+                alpha6 |
+                ((blended.y << 4) & 0x00000fc0u) |
+                ((blended.z << 10) & 0x0003f000u) |
+                ((blended.w << 16) & 0x00fc0000u);
+        imageStore(efb_color, ivec2(x, y), uvec4(value));
+    } else {
+        uint value = (old & 0xff000000u) | blended.y |
+                     (blended.z << 8) | (blended.w << 16);
+        imageStore(efb_color, ivec2(x, y), uvec4(value));
+    }
+}
+
+void main() {
+    if (draw_push.batch_mode == 0u) {
+        current_word_base = draw_push.word_base;
+        int x = si(2u) + int(gl_GlobalInvocationID.x);
+        int y = si(4u) + int(gl_GlobalInvocationID.y);
+        shade_pixel(x, y);
+        return;
+    }
+
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= 640 || y >= 528)
+        return;
+    uint tile = gl_WorkGroupID.y * 40u + gl_WorkGroupID.x;
+    uint first = job.words[draw_push.tile_header_base + tile * 2u];
+    uint count = job.words[draw_push.tile_header_base + tile * 2u + 1u];
+    for (uint i = 0u; i < count; ++i) {
+        uint packet = job.words[draw_push.tile_index_base + first + i];
+        /* Phase 1b (docs/GX_GENERAL_TEV.md): packet stride grown 256->272
+         * words (DRAW_PACKET_BYTES 1024->1088 in gx_vulkan.c) for the fog BP
+         * window + vp_wd() XF register, words 256..267. */
+        current_word_base = draw_push.word_base + packet * 272u;
+        shade_pixel(x, y);
+    }
+}

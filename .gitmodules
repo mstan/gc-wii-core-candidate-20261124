@@ -1,0 +1,3 @@
+[submodule "dsp_lle"]
+	path = dsp_lle
+	url = git@github.com:mstan/gc-dsp-core.git

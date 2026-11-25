@@ -1,0 +1,17 @@
+enable_testing()
+# Native/HLE component qualification in the caller-supplied pinned donor graph.
+function(shared_core_qualify)
+  if(NOT SHARED_GC_WII_CORE_DIR OR NOT SHARED_GC_DSP_CORE_DIR OR NOT GC_DSP_DONOR_HOST_DIR)
+    message(FATAL_ERROR "Supply both extracted core directories and pinned donor host headers")
+  endif()
+  include("${SHARED_GC_WII_CORE_DIR}/CMakeLists.txt")
+  include("${SHARED_GC_DSP_CORE_DIR}/CMakeLists.txt")
+  add_library(shared_core_native_dsp ALIAS gc_dsp_native)
+  add_executable(shared_core_dsp_mail "${SHARED_GC_DSP_CORE_DIR}/qualification/test_hle_mail.cpp")
+  target_link_libraries(shared_core_dsp_mail PRIVATE shared_core_native_dsp)
+  target_compile_options(shared_core_dsp_mail PRIVATE -UNDEBUG)
+  add_test(NAME shared_core_dsp_hle_mail COMMAND shared_core_dsp_mail)
+  set_tests_properties(shared_core_dsp_hle_mail PROPERTIES ENVIRONMENT_MODIFICATION
+    "PATH=path_list_prepend:$<TARGET_FILE_DIR:gcnllr-native-gx>")
+endfunction()
+cmake_language(DEFER CALL shared_core_qualify)

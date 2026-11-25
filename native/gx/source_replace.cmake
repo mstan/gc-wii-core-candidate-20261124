@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+include_guard(GLOBAL)
+function(gcnllr_draw_packet_replace target anchor replacement)
+  string(FIND "${${target}}" "${anchor}" found)
+  if(found EQUAL -1)
+    message(FATAL_ERROR "Pinned retail draw packet boundary differs: ${anchor}")
+  endif()
+  string(REPLACE "${anchor}" "${replacement}" source "${${target}}")
+  set(${target} "${source}" PARENT_SCOPE)
+endfunction()
