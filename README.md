@@ -1,5 +1,7 @@
 # gc-wii-core
 
+Current licensing and the grant for existing owner contributions are documented in [LICENSE-SCOPE.md](LICENSE-SCOPE.md).
+
 Shared low-level machine/device source package extracted from `mstan/gcnllr`
 commit `f07bfb9515082a964c36a4bbafb095dbb2d584b7`, directory
 `third_party/lle/runtime`. Original runtime sources are unchanged. The initial
